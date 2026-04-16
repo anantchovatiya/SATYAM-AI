@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 
 const PRIMARY   = "#7c3aed";
-const EMERALD   = "#10b981";
 const AMBER     = "#f59e0b";
 const BLUE      = "#3b82f6";
 const ROSE      = "#f43f5e";

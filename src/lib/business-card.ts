@@ -54,7 +54,7 @@ function isUnsupportedGeminiModelId(id: string): boolean {
 
 /** Map env value to a model id that works on generativelanguage v1beta. */
 function sanitizeGeminiModelId(raw: string): string {
-  let s = raw.trim().replace(/^models\//i, "");
+  const s = raw.trim().replace(/^models\//i, "");
   if (!s) return "gemini-2.5-flash";
   if (isUnsupportedGeminiModelId(s)) return "gemini-2.5-flash";
   return s;

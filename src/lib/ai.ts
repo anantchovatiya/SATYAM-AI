@@ -310,13 +310,6 @@ export async function generateReply(
     context,
     productCatalogueInformation,
   });
-  const detailsSnippet = shouldIncludeDetails
-    ? extractRelevantCatalogueDetails({
-        customerMessage,
-        context,
-        productCatalogueInformation,
-      })
-    : "";
   const shouldAppendCatalogue = shouldShareCatalogue({
     customerMessage,
     context,
