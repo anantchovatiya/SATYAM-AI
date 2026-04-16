@@ -1,0 +1,1059 @@
+import path from "node:path";
+import { rm, readFile } from "node:fs/promises";
+import { Boom } from "@hapi/boom";
+import { getDb } from "@/lib/mongodb";
+import { leadsCollection } from "@/lib/models/lead";
+import { getOrCreateSettings } from "@/lib/models/settings";
+import { waMessagesCollection } from "@/lib/models/webhook-log";
+import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
+import { analyzeChat, generateReply } from "@/lib/ai";
+import { getEffectiveKnowledge } from "@/lib/knowledge";
+/** Gemini Vision on inbound images — costs API. Set `true` to re-enable business-card scan + Excel. */
+const ENABLE_BUSINESS_CARD_IMAGE_SCAN = false;
+
+export type QrConnectionState =
+  | "idle"
+  | "connecting"
+  | "qr_ready"
+  | "connected"
+  | "error";
+
+export interface QrSnapshot {
+  state: QrConnectionState;
+  qrDataUrl: string | null;
+  connectedPhone: string | null;
+  error: string | null;
+  updatedAt: string;
+}
+
+type WaMessageContent =
+  | { text: string; linkPreview?: null }
+  | { document: Buffer; mimetype: string; fileName: string; caption?: string };
+
+type SocketType = {
+  logout: () => Promise<void>;
+  end: (err?: Error) => void;
+  user?: { id?: string };
+  sendMessage: (
+    jid: string,
+    content: WaMessageContent
+  ) => Promise<{ key?: { id?: string } }>;
+  ev: {
+    on: (event: string, listener: (...args: unknown[]) => void) => void;
+  };
+};
+
+const CATALOGUE_PDF = path.join(process.cwd(), "public", "AgriBird Brochure.pdf");
+
+interface QrConnectorStore {
+  socket: SocketType | null;
+  status: QrSnapshot;
+  booting: Promise<QrSnapshot> | null;
+  autoReplyTimer: ReturnType<typeof setInterval> | null;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  reconnectAttempts: number;
+  processedInboundIds: Set<string>;
+  inflightInboundIds: Set<string>;
+  recentReplyByPhone: Map<string, number>;
+  /** Timestamp when the current QR session became connected — used to reject
+   *  any history-replay messages Baileys emits before/during the handshake. */
+  connectedAt: number | null;
+}
+
+const GLOBAL_KEY = "__satyam_wa_qr_connector__";
+
+function getStore(): QrConnectorStore {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[GLOBAL_KEY]) {
+    g[GLOBAL_KEY] = {
+      socket: null,
+      booting: null,
+      autoReplyTimer: null,
+      reconnectTimer: null,
+      reconnectAttempts: 0,
+      processedInboundIds: new Set<string>(),
+      inflightInboundIds: new Set<string>(),
+      recentReplyByPhone: new Map<string, number>(),
+      connectedAt: null,
+      status: {
+        state: "idle",
+        qrDataUrl: null,
+        connectedPhone: null,
+        error: null,
+        updatedAt: new Date().toISOString(),
+      },
+    } satisfies QrConnectorStore;
+  }
+  return g[GLOBAL_KEY] as QrConnectorStore;
+}
+
+function setStatus(partial: Partial<QrSnapshot>) {
+  const store = getStore();
+  store.status = {
+    ...store.status,
+    ...partial,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function normalizePhone(raw: string): string {
+  const digits = String(raw).replace(/\D/g, "");
+  if (!digits) return raw;
+  if (digits.length === 12 && digits.startsWith("91")) {
+    return `+${digits.slice(0, 2)} ${digits.slice(2, 7)} ${digits.slice(7)}`;
+  }
+  return `+${digits}`;
+}
+
+function extractText(message: unknown): string {
+  const m = message as {
+    conversation?: string;
+    extendedTextMessage?: { text?: string };
+    imageMessage?: { caption?: string };
+    videoMessage?: { caption?: string };
+  };
+
+  return (
+    m?.conversation ??
+    m?.extendedTextMessage?.text ??
+    m?.imageMessage?.caption ??
+    m?.videoMessage?.caption ??
+    ""
+  );
+}
+
+function isImageMessage(message: unknown): boolean {
+  const m = message as { imageMessage?: unknown };
+  return Boolean(m?.imageMessage);
+}
+
+async function processBusinessCardImage(args: {
+  msg: unknown;
+  from: string;
+  jid: string;
+  senderName: string;
+}): Promise<void> {
+  if (!ENABLE_BUSINESS_CARD_IMAGE_SCAN) return;
+
+  try {
+    const { downloadMediaMessage } = await import("@whiskeysockets/baileys");
+
+    const imageBuffer = (await downloadMediaMessage(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      args.msg as any,
+      "buffer",
+      {}
+    )) as Buffer;
+
+    if (!imageBuffer || imageBuffer.length === 0) {
+      console.warn("[business-card] Empty image buffer, skipping");
+      return;
+    }
+
+    const raw = args.msg as { message?: { imageMessage?: { mimetype?: string } } };
+    const mimeType =
+      raw?.message?.imageMessage?.mimetype?.trim() || "image/jpeg";
+
+    const { extractBusinessCardData, saveBusinessCardToExcel } = await import(
+      "@/lib/business-card"
+    );
+    const data = await extractBusinessCardData(imageBuffer, mimeType);
+
+    if (!data) {
+      return;
+    }
+
+    await saveBusinessCardToExcel(data, normalizePhone(args.from));
+
+    const name = data.name ? ` for ${data.name}` : "";
+    const confirmText =
+      `Got your business card${name}! 👍 I've saved the details.`;
+    await sendQrTextMessage(args.jid, confirmText);
+
+    await persistIncomingOrOutgoingMessage({
+      waMessageId: `bc-confirm-${Date.now()}`,
+      from: args.from,
+      senderName: "SATYAM AI",
+      text: confirmText,
+      direction: "out",
+      timestamp: new Date(),
+    });
+  } catch (err) {
+    console.error("[business-card] Failed to process image:", err);
+  }
+}
+
+async function persistIncomingOrOutgoingMessage(args: {
+  waMessageId: string;
+  from: string;
+  remoteJid?: string;
+  senderName?: string;
+  text: string;
+  direction: "in" | "out";
+  timestamp?: Date;
+}) {
+  const db = await getDb();
+  const messagesCol = waMessagesCollection(db);
+  const leadsCol = leadsCollection(db);
+  const now = args.timestamp ?? new Date();
+  const normalizedPhone = normalizePhone(args.from);
+
+  if (args.direction === "out") {
+    const duplicateWindowStart = new Date(now.getTime() - 20_000);
+    const recentDuplicate = await messagesCol.findOne({
+      from: args.from,
+      direction: "out",
+      text: args.text,
+      timestamp: { $gte: duplicateWindowStart },
+    });
+    if (recentDuplicate) {
+      return;
+    }
+  }
+
+  await messagesCol
+    .updateOne(
+      { waMessageId: args.waMessageId },
+      {
+        $setOnInsert: {
+          waMessageId: args.waMessageId,
+          from: args.from,
+          remoteJid: args.remoteJid,
+          senderName: args.senderName ?? normalizedPhone,
+          text: args.text,
+          timestamp: now,
+          direction: args.direction,
+          phoneNumberId: "qr-linked",
+        },
+      },
+      { upsert: true }
+    )
+    .catch(() => {});
+
+  const lead = await leadsCol.findOne({ phone: normalizedPhone });
+  if (!lead) {
+    await leadsCol.insertOne({
+      name: args.senderName ?? normalizedPhone,
+      phone: normalizedPhone,
+      source: "WhatsApp",
+      status: "New",
+      conversationStatus: args.direction === "in" ? "awaiting_team_reply" : "new_inquiry",
+      lastMessage: args.text,
+      interestScore: 50,
+      assignedTo: "Unassigned",
+      lastFollowup: "Just now",
+      lastInboundAt: args.direction === "in" ? now : undefined,
+      lastOutboundAt: args.direction === "out" ? now : undefined,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return;
+  }
+
+  await leadsCol.updateOne(
+    { _id: lead._id },
+    {
+      $set: {
+        lastMessage: args.text || lead.lastMessage,
+        lastInboundAt: args.direction === "in" ? now : lead.lastInboundAt,
+        lastOutboundAt: args.direction === "out" ? now : lead.lastOutboundAt,
+        conversationStatus: getConversationStatus({
+          lastInboundAt: args.direction === "in" ? now : lead.lastInboundAt,
+          lastOutboundAt: args.direction === "out" ? now : lead.lastOutboundAt,
+          needsHuman: lead.needsHuman,
+        }),
+        updatedAt: now,
+      },
+    }
+  );
+}
+
+function extractPhoneFromJid(jid?: string | null): string | null {
+  if (!jid) return null;
+  if (jid === "status@broadcast") return null;
+  if (!jid.includes("@")) return null;
+  const [phone] = jid.split("@");
+  if (!phone || phone.length < 5) return null;
+  return phone;
+}
+
+function parseMessageTimestamp(input: unknown): Date | undefined {
+  if (typeof input === "number") {
+    return new Date(input * 1000);
+  }
+  if (typeof input === "bigint") {
+    return new Date(Number(input) * 1000);
+  }
+  if (typeof input === "object" && input !== null) {
+    const maybeLow = (input as { low?: unknown }).low;
+    if (typeof maybeLow === "number") {
+      return new Date(maybeLow * 1000);
+    }
+  }
+  return undefined;
+}
+
+function isRecentInbound(ts?: Date): boolean {
+  if (!ts) return true;
+  const ageMs = Date.now() - ts.getTime();
+  return ageMs >= 0 && ageMs <= 5 * 60 * 1000;
+}
+
+async function persistBaileysMessage(msg: {
+  key?: { id?: string; remoteJid?: string; fromMe?: boolean };
+  message?: unknown;
+  pushName?: string;
+  messageTimestamp?: unknown;
+}) {
+  const phone = extractPhoneFromJid(msg.key?.remoteJid);
+  if (!phone) return;
+
+  const text = extractText(msg.message);
+  if (!text) return;
+
+  const waMessageId = msg.key?.id ?? `qr-${Date.now()}-${Math.random()}`;
+  const direction = msg.key?.fromMe ? "out" : "in";
+  const timestamp = parseMessageTimestamp(msg.messageTimestamp);
+
+  await persistIncomingOrOutgoingMessage({
+    waMessageId,
+    from: phone,
+    remoteJid: msg.key?.remoteJid,
+    senderName: msg.pushName || phone,
+    text,
+    direction,
+    timestamp,
+  });
+}
+
+async function processQrInboundAutoReply(args: {
+  inboundMessageId?: string;
+  jid: string;
+  from: string;
+  senderName: string;
+  text: string;
+}) {
+  const store = getStore();
+  const inboundId = args.inboundMessageId ?? `${args.from}:${normalizeTextForKey(args.text)}`;
+  if (store.processedInboundIds.has(inboundId) || store.inflightInboundIds.has(inboundId)) {
+    return;
+  }
+  const now = Date.now();
+  const lastReplyAt = store.recentReplyByPhone.get(args.from) ?? 0;
+  // Defensive throttle to prevent duplicate reply bursts from repeated upsert events.
+  if (now - lastReplyAt < 12_000) {
+    return;
+  }
+  store.inflightInboundIds.add(inboundId);
+  try {
+    const db = await getDb();
+    const settings = await getOrCreateSettings(db);
+    if (!settings.autoReply) {
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
+
+    const messagesCol = waMessagesCollection(db);
+    const leadsCol = leadsCollection(db);
+    // Burst guard: wait briefly so back-to-back user messages collapse into one latest reply.
+    await sleep(1800);
+    if (args.inboundMessageId) {
+      const latestInbound = await messagesCol
+        .find({ from: args.from, direction: "in" })
+        .sort({ timestamp: -1 })
+        .limit(1)
+        .toArray();
+      if (latestInbound[0] && latestInbound[0].waMessageId !== args.inboundMessageId) {
+        store.processedInboundIds.add(inboundId);
+        return;
+      }
+      if (latestInbound[0]) {
+        const alreadyReplied = await messagesCol.findOne({
+          from: args.from,
+          direction: "out",
+          timestamp: { $gte: latestInbound[0].timestamp },
+        });
+        if (alreadyReplied) {
+          store.processedInboundIds.add(inboundId);
+          return;
+        }
+      }
+    }
+    const normalizedPhone = normalizePhone(args.from);
+    const lead = await leadsCol.findOne({ phone: normalizedPhone });
+    if (lead?.needsHuman) {
+      await leadsCol.updateOne(
+        { _id: lead._id },
+        {
+          $set: {
+            conversationStatus: "awaiting_team_reply",
+            lastInboundAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      ).catch(() => {});
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
+
+    const recent = await messagesCol
+      .find({ from: args.from })
+      .sort({ timestamp: -1 })
+      .limit(20)
+      .toArray();
+
+    const context = recent
+      .reverse()
+      .map((m) => ({ text: m.text, direction: m.direction, timestamp: m.timestamp.toISOString() }));
+    const analysis = await analyzeChat(context, settings.humanHandoverKeywords);
+    const shouldEscalate = shouldEscalateConversation({
+      latestText: args.text,
+      keywords: settings.humanHandoverKeywords,
+      analysisNeedsHuman: analysis.needsHuman,
+      sentiment: analysis.sentiment,
+    });
+
+    if (shouldEscalate) {
+      if (lead) {
+        await leadsCol.updateOne(
+          { _id: lead._id },
+          {
+            $set: {
+              needsHuman: true,
+              conversationStatus: "escalated",
+              preferredLanguage: analysis.language,
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
+
+    const kb = getEffectiveKnowledge(settings);
+    const reply = await generateReply(args.text, {
+      aiTone: settings.aiTone,
+      leadName: lead?.name ?? args.senderName,
+      context,
+      handoverKeywords: settings.humanHandoverKeywords,
+      companyInformation: kb.companyInformation,
+      productCatalogueInformation: kb.productCatalogueInformation,
+      catalogueLink: kb.catalogueLink,
+      restrictToKnowledgeBase: kb.restrictToKnowledgeBase,
+      autoShareCatalogue: settings.autoShareCatalogue,
+    });
+    const safeReplyText = coerceCompleteReply(reply.reply, lead?.name ?? args.senderName);
+    if (safeReplyText !== reply.reply.trim().replace(/\s+/g, " ")) {
+      console.warn("[wa-qr] replaced incomplete model response", {
+        original: reply.reply,
+        replaced: safeReplyText,
+      });
+    }
+
+    const sent = await sendQrTextMessage(args.jid, safeReplyText);
+    if (!sent.ok) {
+      console.error("[wa-qr] auto-reply send failed:", sent.error);
+      return;
+    }
+
+    await persistIncomingOrOutgoingMessage({
+      waMessageId: sent.messageId,
+      from: args.from,
+      senderName: "SATYAM AI",
+      text: safeReplyText,
+      direction: "out",
+      timestamp: new Date(),
+    });
+
+    // Send the PDF catalogue as a follow-up document when the AI triggered it,
+    // but only if we haven't already sent it to this contact before.
+    if (reply.sharedCatalogue && settings.autoShareCatalogue) {
+      const alreadySentPdf = await messagesCol.findOne({
+        from: args.from,
+        direction: "out",
+        text: "[AgriBird Catalogue PDF]",
+      });
+      if (!alreadySentPdf) {
+        const catResult = await sendQrCatalogue(args.jid);
+        if (catResult.ok) {
+          await persistIncomingOrOutgoingMessage({
+            waMessageId: catResult.messageId,
+            from: args.from,
+            senderName: "SATYAM AI",
+            text: "[AgriBird Catalogue PDF]",
+            direction: "out",
+            timestamp: new Date(),
+          });
+        } else {
+          console.warn("[wa-qr] catalogue PDF send failed:", catResult.error);
+        }
+      }
+    }
+
+    store.recentReplyByPhone.set(args.from, Date.now());
+    store.processedInboundIds.add(inboundId);
+  } finally {
+    store.inflightInboundIds.delete(inboundId);
+  }
+}
+
+async function runQrAutoReplySweep(limit = 10) {
+  const store = getStore();
+  if (!store.socket || store.status.state !== "connected") return;
+
+  const db = await getDb();
+  const settings = await getOrCreateSettings(db);
+  const messagesCol = waMessagesCollection(db);
+  const leadsCol = leadsCollection(db);
+
+  const inbound = await messagesCol
+    .find({ direction: "in", phoneNumberId: "qr-linked" })
+    .sort({ timestamp: -1 })
+    .limit(limit)
+    .toArray();
+
+  for (const msg of inbound) {
+    const inboundId = msg.waMessageId;
+    if (store.processedInboundIds.has(inboundId) || store.inflightInboundIds.has(inboundId)) continue;
+    store.inflightInboundIds.add(inboundId);
+    try {
+      const lastReplyAt = store.recentReplyByPhone.get(msg.from) ?? 0;
+      // Keep generation idempotent during rapid upserts / overlapping sweeps.
+      if (Date.now() - lastReplyAt < 12_000) {
+        continue;
+      }
+
+      const hasOutbound = await messagesCol.findOne({
+        from: msg.from,
+        direction: "out",
+        _id: { $gt: msg._id },
+      });
+      if (hasOutbound) {
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+
+      const newerInbound = await messagesCol.findOne({
+        from: msg.from,
+        direction: "in",
+        timestamp: { $gt: msg.timestamp },
+      });
+      if (newerInbound) {
+        // Only reply to latest inbound in a burst to avoid double Gemini generations.
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+
+      if (!settings.autoReply) {
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+
+      const normalized = normalizePhone(msg.from);
+      const lead = await leadsCol.findOne({ phone: normalized });
+      if (lead?.needsHuman) {
+        await leadsCol.updateOne(
+          { _id: lead._id },
+          {
+            $set: {
+              conversationStatus: "awaiting_team_reply",
+              lastInboundAt: msg.timestamp,
+              updatedAt: new Date(),
+            },
+          }
+        ).catch(() => {});
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+
+      const recent = await messagesCol
+        .find({ from: msg.from })
+        .sort({ timestamp: -1 })
+        .limit(20)
+        .toArray();
+      const context = recent
+        .reverse()
+        .map((m) => ({ text: m.text, direction: m.direction, timestamp: m.timestamp.toISOString() }));
+      const analysis = await analyzeChat(context, settings.humanHandoverKeywords);
+      const shouldEscalate = shouldEscalateConversation({
+        latestText: msg.text,
+        keywords: settings.humanHandoverKeywords,
+        analysisNeedsHuman: analysis.needsHuman,
+        sentiment: analysis.sentiment,
+      });
+
+      if (shouldEscalate) {
+        if (lead) {
+          await leadsCol.updateOne(
+            { _id: lead._id },
+            { $set: { needsHuman: true, conversationStatus: "escalated", updatedAt: new Date() } }
+          );
+        }
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+
+      const kb = getEffectiveKnowledge(settings);
+      const reply = await generateReply(msg.text, {
+        aiTone: settings.aiTone,
+        leadName: lead?.name ?? msg.senderName ?? "there",
+        context,
+        handoverKeywords: settings.humanHandoverKeywords,
+        companyInformation: kb.companyInformation,
+        productCatalogueInformation: kb.productCatalogueInformation,
+        catalogueLink: kb.catalogueLink,
+        restrictToKnowledgeBase: kb.restrictToKnowledgeBase,
+        autoShareCatalogue: settings.autoShareCatalogue,
+      });
+      const safeReplyText = coerceCompleteReply(reply.reply, lead?.name ?? msg.senderName ?? "there");
+      if (safeReplyText !== reply.reply.trim().replace(/\s+/g, " ")) {
+        console.warn("[wa-qr] replaced incomplete model response (sweep)", {
+          original: reply.reply,
+          replaced: safeReplyText,
+        });
+      }
+      const sent = await sendQrTextMessage(msg.from, safeReplyText);
+      if (!sent.ok) {
+        console.error("[wa-qr] sweep send failed:", sent.error);
+        continue;
+      }
+
+      await persistIncomingOrOutgoingMessage({
+        waMessageId: sent.messageId,
+        from: msg.from,
+        senderName: "SATYAM AI",
+        text: safeReplyText,
+        direction: "out",
+        timestamp: new Date(),
+      });
+
+      // Send the PDF catalogue as a separate document message when triggered,
+      // but only if it hasn't already been sent to this contact before.
+      if (reply.sharedCatalogue && settings.autoShareCatalogue) {
+        const alreadySentPdf = await messagesCol.findOne({
+          from: msg.from,
+          direction: "out",
+          text: "[AgriBird Catalogue PDF]",
+        });
+        if (!alreadySentPdf) {
+          const catResult = await sendQrCatalogue(msg.from);
+          if (catResult.ok) {
+            await persistIncomingOrOutgoingMessage({
+              waMessageId: catResult.messageId,
+              from: msg.from,
+              senderName: "SATYAM AI",
+              text: "[AgriBird Catalogue PDF]",
+              direction: "out",
+              timestamp: new Date(),
+            });
+          } else {
+            console.warn("[wa-qr] catalogue PDF send failed:", catResult.error);
+          }
+        }
+      }
+
+      store.recentReplyByPhone.set(msg.from, Date.now());
+      store.processedInboundIds.add(inboundId);
+    } finally {
+      store.inflightInboundIds.delete(inboundId);
+    }
+  }
+}
+
+
+const AUTH_DIR = path.join(process.cwd(), ".wa-auth", "default");
+
+async function stopSocket(clearAuth = false) {
+  const store = getStore();
+  if (store.autoReplyTimer) {
+    clearInterval(store.autoReplyTimer);
+    store.autoReplyTimer = null;
+  }
+  if (store.reconnectTimer) {
+    clearTimeout(store.reconnectTimer);
+    store.reconnectTimer = null;
+  }
+  store.reconnectAttempts = 0;
+  if (!store.socket) return;
+  try {
+    await store.socket.logout();
+  } catch {
+    // Ignore logout errors; we still close socket below.
+  }
+  try {
+    store.socket.end(new Error("QR session restarted"));
+  } catch {
+    // Ignore close errors.
+  }
+  store.socket = null;
+
+  if (clearAuth) {
+    await rm(AUTH_DIR, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+export async function startQrConnection(forceRestart = false): Promise<QrSnapshot> {
+  const store = getStore();
+
+  if (forceRestart) {
+    await stopSocket(true);
+    store.booting = null;
+    setStatus({
+      state: "idle",
+      connectedPhone: null,
+      qrDataUrl: null,
+      error: null,
+    });
+  }
+
+  if (!forceRestart && (store.status.state === "connected" || store.status.state === "qr_ready")) {
+    return store.status;
+  }
+
+  if (store.booting) {
+    return store.booting;
+  }
+
+  store.booting = (async () => {
+    try {
+      setStatus({ state: "connecting", qrDataUrl: null, error: null });
+
+      // Force ws pure JS path; avoids native bufferutil mismatch under Next bundling.
+      process.env.WS_NO_BUFFER_UTIL = "1";
+      process.env.WS_NO_UTF_8_VALIDATE = "1";
+
+      const [{ fetchLatestBaileysVersion, makeWASocket, useMultiFileAuthState, DisconnectReason }, qrMod] =
+        await Promise.all([
+          import("@whiskeysockets/baileys"),
+          import("qrcode"),
+        ]);
+      const toQrDataUrl =
+        typeof qrMod.toDataURL === "function"
+          ? qrMod.toDataURL
+          : typeof qrMod.default?.toDataURL === "function"
+          ? qrMod.default.toDataURL
+          : null;
+      if (!toQrDataUrl) {
+        throw new Error("QR encoder unavailable");
+      }
+
+      const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      const { version } = await fetchLatestBaileysVersion();
+
+      const sock = makeWASocket({
+        auth: state,
+        version,
+        printQRInTerminal: false,
+        browser: ["SATYAM AI CRM", "Chrome", "1.0.0"],
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+      });
+
+      store.socket = sock as unknown as SocketType;
+      sock.ev.on("creds.update", saveCreds);
+
+      sock.ev.on("messages.upsert", ({ messages }) => {
+        const store = getStore();
+        for (const msg of messages ?? []) {
+          const ts = parseMessageTimestamp(msg.messageTimestamp);
+
+          // Reject any message that was sent before this session connected.
+          // This blocks Baileys from replaying historical messages into the DB.
+          if (store.connectedAt !== null && ts) {
+            if (ts.getTime() < store.connectedAt) continue;
+          }
+
+          // Skip outbound messages entirely for routing logic
+          if (msg.key?.fromMe) {
+            persistBaileysMessage(msg as unknown as Parameters<typeof persistBaileysMessage>[0]).catch((err) => {
+              console.error("[wa-qr] persist outbound failed:", err);
+            });
+            continue;
+          }
+
+          const jid = msg.key?.remoteJid ?? "";
+          const from = extractPhoneFromJid(jid);
+          if (!from) continue;
+
+          // ── Image: check if it's a business card ──────────────────────────
+          if (isImageMessage(msg.message) && isRecentInbound(ts)) {
+            processBusinessCardImage({
+              msg,
+              from,
+              jid,
+              senderName: msg.pushName || from,
+            }).catch((err) => {
+              console.error("[wa-qr] business-card processing failed:", err);
+            });
+            continue; // don't run auto-reply for image messages
+          }
+
+          // ── Text: normal persist + auto-reply ────────────────────────────
+          persistBaileysMessage(msg as unknown as Parameters<typeof persistBaileysMessage>[0]).catch((err) => {
+            console.error("[wa-qr] persist message failed:", err);
+          });
+
+          const text = extractText(msg.message);
+          if (!text) continue;
+          if (!isRecentInbound(ts)) continue;
+
+          const inboundMessageId = msg.key?.id ?? undefined;
+          processQrInboundAutoReply({
+            inboundMessageId,
+            jid,
+            from,
+            senderName: msg.pushName || from,
+            text,
+          }).catch((err) => {
+            console.error("[wa-qr] auto-reply pipeline failed:", err);
+          });
+        }
+      });
+
+      // History sync is intentionally disabled (syncFullHistory: false).
+      // We only want NEW messages that arrive after this session connects.
+
+      sock.ev.on("connection.update", async (update) => {
+        if (update.qr) {
+          const qrDataUrl = await toQrDataUrl(update.qr);
+          setStatus({ state: "qr_ready", qrDataUrl, error: null });
+        }
+
+        if (update.connection === "open") {
+          const phone = sock.user?.id?.split(":")[0]?.split("@")[0] ?? null;
+          store.connectedAt = Date.now();
+          store.reconnectAttempts = 0;
+          if (store.reconnectTimer) {
+            clearTimeout(store.reconnectTimer);
+            store.reconnectTimer = null;
+          }
+          setStatus({
+            state: "connected",
+            connectedPhone: phone,
+            qrDataUrl: null,
+            error: null,
+          });
+          if (store.autoReplyTimer) clearInterval(store.autoReplyTimer);
+          store.autoReplyTimer = setInterval(() => {
+            runQrAutoReplySweep(20).catch((err) => {
+              console.error("[wa-qr] auto-reply sweep failed:", err);
+            });
+          }, 8000);
+          runQrAutoReplySweep(20).catch(() => {});
+        }
+
+        if (update.connection === "close") {
+          const statusCode =
+            (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+          const isLoggedOut    = statusCode === DisconnectReason.loggedOut;
+          // connectionReplaced (440) = another session kicked this one — conflict loop
+          const isReplaced     = statusCode === DisconnectReason.connectionReplaced;
+          const shouldReconnect = !isLoggedOut && !isReplaced;
+
+          store.socket = null;
+          if (store.autoReplyTimer) {
+            clearInterval(store.autoReplyTimer);
+            store.autoReplyTimer = null;
+          }
+          if (store.reconnectTimer) {
+            clearTimeout(store.reconnectTimer);
+            store.reconnectTimer = null;
+          }
+
+          if (isReplaced) {
+            store.reconnectAttempts = 0;
+            setStatus({
+              state: "idle",
+              connectedPhone: null,
+              qrDataUrl: null,
+              error:
+                "Session replaced — another WhatsApp Web session is active. " +
+                "Close other sessions, then click Connect again.",
+            });
+            return;
+          }
+
+          if (!shouldReconnect) {
+            store.reconnectAttempts = 0;
+            setStatus({
+              state: "idle",
+              connectedPhone: null,
+              qrDataUrl: null,
+              error: "WhatsApp session logged out. Click Connect again.",
+            });
+            return;
+          }
+
+          const MAX_ATTEMPTS = 5;
+          if (store.reconnectAttempts >= MAX_ATTEMPTS) {
+            store.reconnectAttempts = 0;
+            setStatus({
+              state: "error",
+              qrDataUrl: null,
+              error: `Reconnection failed after ${MAX_ATTEMPTS} attempts. Click Connect again.`,
+            });
+            return;
+          }
+
+          // Exponential backoff: 3s, 6s, 12s, 24s, 30s (cap)
+          const delay = Math.min(3000 * Math.pow(2, store.reconnectAttempts), 30000);
+          store.reconnectAttempts += 1;
+
+          setStatus({
+            state: "connecting",
+            qrDataUrl: null,
+            error: `Connection dropped. Reconnecting in ${Math.round(delay / 1000)}s (attempt ${store.reconnectAttempts}/${MAX_ATTEMPTS})…`,
+          });
+
+          store.reconnectTimer = setTimeout(() => {
+            store.reconnectTimer = null;
+            store.booting = null;
+            startQrConnection().catch((err) => {
+              console.error("[wa-qr] scheduled reconnect failed:", err);
+            });
+          }, delay);
+        }
+      });
+
+      return store.status;
+    } catch (err) {
+      setStatus({
+        state: "error",
+        qrDataUrl: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return store.status;
+    } finally {
+      store.booting = null;
+    }
+  })();
+
+  return store.booting;
+}
+
+export function getQrSnapshot(): QrSnapshot {
+  return getStore().status;
+}
+
+export async function stopQrConnection(): Promise<void> {
+  await stopSocket(true);
+  setStatus({ state: "idle", qrDataUrl: null, connectedPhone: null, error: null });
+}
+
+export async function sendQrCatalogue(
+  to: string
+): Promise<{ ok: true; messageId: string } | { ok: false; error: string }> {
+  const store = getStore();
+  if (!store.socket || store.status.state !== "connected") {
+    return { ok: false, error: "QR session is not connected" };
+  }
+
+  const jids = resolveSendJids(to);
+  if (jids.length === 0) return { ok: false, error: "Invalid recipient" };
+
+  let pdfBuffer: Buffer;
+  try {
+    pdfBuffer = await readFile(CATALOGUE_PDF);
+  } catch {
+    return { ok: false, error: "Catalogue PDF not found in public folder" };
+  }
+
+  try {
+    const result = await store.socket.sendMessage(jids[0], {
+      document: pdfBuffer,
+      mimetype: "application/pdf",
+      fileName: "AgriBird Brochure.pdf",
+    });
+    return { ok: true, messageId: result?.key?.id ?? `pdf-${Date.now()}` };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to send PDF",
+    };
+  }
+}
+
+export async function sendQrTextMessage(to: string, text: string) {
+  const store = getStore();
+  if (!store.socket || store.status.state !== "connected") {
+    return { ok: false as const, error: "QR session is not connected" };
+  }
+
+  const jids = resolveSendJids(to);
+  if (jids.length === 0) {
+    return { ok: false as const, error: "Invalid recipient JID/number" };
+  }
+
+  let lastError = "Failed to send via QR";
+  for (const jid of jids) {
+    try {
+      console.log("[wa-qr] send attempt", { jid });
+      // linkPreview: null disables Baileys' getLinkPreview which is broken in this env
+      const res = await store.socket.sendMessage(jid, { text, linkPreview: null });
+      return {
+        ok: true as const,
+        messageId: res.key?.id ?? `qr-out-${Date.now()}`,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  return {
+    ok: false as const,
+    error: lastError,
+  };
+}
+
+function resolveSendJids(to: string): string[] {
+  if (!to) return [];
+  if (to.includes("@")) return [to];
+  if (to.includes(":")) {
+    return [`${to}@lid`, `${to}@s.whatsapp.net`];
+  }
+  const digits = to.replace(/\D/g, "");
+  if (!digits) return [];
+
+  // Heuristic: long IDs in history are usually LID identities, not phone MSISDNs.
+  if (digits.length > 12) {
+    return [`${digits}@lid`, `${digits}@s.whatsapp.net`];
+  }
+
+  // Normal phone-number chats.
+  return [`${digits}@s.whatsapp.net`, `${digits}@lid`];
+}
+
+function normalizeTextForKey(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function coerceCompleteReply(reply: string, leadName: string): string {
+  const compact = reply.trim().replace(/\s+/g, " ");
+  const fallback = `Thanks ${leadName}. Could you share a bit more detail so I can help you accurately?`;
+  if (!compact || compact.length < 10) return fallback;
+
+  // Strip the Details/Catalogue appendix before checking the core sentence
+  const core = compact
+    .split(/\s+Details:\s+/i)[0]
+    .split(/\s+Catalogue:\s+/i)[0]
+    .trim();
+
+  // Strip trailing emoji/whitespace to inspect actual ending text
+  const ending = core.replace(/[\s\p{Extended_Pictographic}\uFE0F\u200D]+$/gu, "").trim();
+  if (!ending) return compact; // emoji-only core is unusual but not truncated
+
+  // Only reject clear truncation signals:
+  // 1. Ends with comma, colon, or semicolon → mid-sentence cut
+  if (/[,:;]\s*$/.test(ending)) return fallback;
+  // 2. Ends with a dangling apostrophe-word like "i'" or "that'" (broken contraction)
+  if (/\b\w+'\s*$/.test(ending) && !/[.!?]/.test(ending.slice(-6))) return fallback;
+  // 3. Extremely short core (< 8 chars) with no punctuation
+  if (ending.length < 8 && !/[.!?]/.test(ending)) return fallback;
+
+  return compact;
+}

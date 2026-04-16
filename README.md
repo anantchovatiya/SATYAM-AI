@@ -1,36 +1,55 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SATYAM AI
 
-## Getting Started
+Modern SaaS admin dashboard built with Next.js 14, Tailwind CSS, and MongoDB-ready backend wiring.
 
-First, run the development server:
+## Features
+
+- Login and signup pages
+- Responsive dashboard shell with sidebar navigation
+- Dark and light mode
+- Pages: Dashboard, Leads, Inbox, Followups, Templates, Settings
+- Extra pages: Analytics and Automation Settings
+- Dummy data widgets for quick iteration
+- API route wired for MongoDB fallback to dummy data
+
+## Tech Stack
+
+- Next.js 14 (App Router)
+- Tailwind CSS
+- MongoDB Node driver
+- Deploy ready for Vercel
+
+## Run Locally
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Environment Variables
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Create `.env.local` from `.env.example`:
 
-## Learn More
+```bash
+cp .env.example .env.local
+```
 
-To learn more about Next.js, take a look at the following resources:
+Set:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- `MONGODB_URI` - MongoDB connection string
+- `MONGODB_DB` - Database name
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+If `MONGODB_URI` is missing, app works in dummy-data mode.
 
-## Deploy on Vercel
+## API
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- `GET /api/leads` returns MongoDB records when configured, otherwise dummy leads.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Deploy to Vercel
+
+1. Push this project to GitHub.
+2. Import it in Vercel.
+3. Add `MONGODB_URI` and `MONGODB_DB` in Vercel project environment variables.
+4. Deploy.
