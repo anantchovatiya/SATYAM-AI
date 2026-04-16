@@ -1,4 +1,3 @@
-import { CheckCircle2, Clock, AlertCircle, Plus } from "lucide-react";
 import { getDb } from "@/lib/mongodb";
 import { followupsCollection, followupDocToRow } from "@/lib/models/followup";
 import { leadsCollection } from "@/lib/models/lead";
@@ -6,8 +5,6 @@ import { DbError } from "@/components/db-error";
 import { FollowupsClient } from "./followups-client";
 
 export const dynamic = "force-dynamic";
-
-export { CheckCircle2, Clock, AlertCircle, Plus };
 
 export default async function FollowupsPage() {
   try {

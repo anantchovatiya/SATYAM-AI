@@ -855,39 +855,6 @@ function isAffirmativeForDetails(message: string, context: IncomingMessage[]): b
   return /\b(details?|catalog|catalogue|brochure|price|pricing|spec|carton|qty|quantity|model)\b/.test(recent);
 }
 
-function extractRelevantCatalogueDetails(args: {
-  customerMessage: string;
-  context: IncomingMessage[];
-  productCatalogueInformation: string;
-}): string {
-  const lines = args.productCatalogueInformation
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length >= 10)
-    .slice(0, 300);
-  if (lines.length === 0) return "";
-
-  const query = `${args.customerMessage} ${args.context.slice(-4).map((m) => m.text).join(" ")}`.toLowerCase();
-  const stopwords = new Set([
-    "the","and","for","with","that","this","you","your","are","was","have","from","please","send","yes","okay","ok","hi","hello","how","what","when"
-  ]);
-  const terms = Array.from(new Set(query.split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !stopwords.has(t))));
-  const scored = lines
-    .map((line) => {
-      const lower = line.toLowerCase();
-      const score = terms.reduce((s, t) => s + (lower.includes(t) ? 1 : 0), 0);
-      return { line, score };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  const picked = scored.filter((x) => x.score > 0).slice(0, 3).map((x) => x.line);
-  const fallback = lines.slice(0, 3);
-  return (picked.length > 0 ? picked : fallback)
-    .map((l) => `- ${l}`)
-    .join("\n");
-}
-
-
 function localizedGreetingReply(language: string, leadName: string, aiTone: string): string {
   if (language === "Hindi") {
     return aiTone === "professional"

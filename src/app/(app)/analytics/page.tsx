@@ -91,7 +91,7 @@ export default async function AnalyticsPage() {
       fCol.countDocuments(),
 
       // Avg response time — pair in → out messages per phone, last 7 days
-      mCol.aggregate<{ _id: string; avgMs: number }>([
+      mCol.aggregate<{ _id: string; messages: { dir: string; ts: Date }[] }>([
         { $match: { timestamp: { $gte: since7 } } },
         { $sort:  { from: 1, timestamp: 1 } },
         { $group: { _id: "$from", messages: { $push: { dir: "$direction", ts: "$timestamp" } } } },
@@ -146,7 +146,7 @@ export default async function AnalyticsPage() {
     let totalResponseMs = 0;
     let responsePairs   = 0;
     for (const phone of msgPairsRaw) {
-      const msgs = phone.messages as { dir: string; ts: Date }[];
+      const msgs = phone.messages;
       for (let i = 0; i < msgs.length - 1; i++) {
         if (msgs[i].dir === "in" && msgs[i + 1].dir === "out") {
           totalResponseMs += new Date(msgs[i + 1].ts).getTime() - new Date(msgs[i].ts).getTime();
