@@ -6,7 +6,11 @@ import { followupsCollection } from "@/lib/models/followup";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { generateFollowUp } from "@/lib/ai";
 import { hasSensitiveTopic } from "@/lib/conversation-status";
-import { sendTextMessage, type WhatsAppRuntimeConfig } from "@/lib/whatsapp";
+import {
+  resolveWhatsAppRuntimeConfig,
+  sendTextMessage,
+  type WhatsAppRuntimeConfig,
+} from "@/lib/whatsapp";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
 
 interface RunOptions {
@@ -50,12 +54,8 @@ async function runFollowupAutomation(options: RunOptions) {
   const followupsCol = followupsCollection(db);
   const settings = await getOrCreateSettings(db);
   const now = new Date();
-  const waConfig: WhatsAppRuntimeConfig | undefined = settings.whatsapp
-    ? {
-        token: settings.whatsapp.token,
-        phoneNumberId: settings.whatsapp.phoneNumberId,
-      }
-    : undefined;
+  const waConfig: WhatsAppRuntimeConfig | undefined =
+    resolveWhatsAppRuntimeConfig(settings);
 
   const leads = await leadsCol
     .find({ source: "WhatsApp", status: { $ne: "Closed" } })

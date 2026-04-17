@@ -32,6 +32,7 @@ import {
 } from "@/lib/models/webhook-log";
 import {
   parseWebhookPayload,
+  resolveWhatsAppRuntimeConfig,
   sendTextMessage,
   markAsRead,
   type ParsedWaMessage,
@@ -204,12 +205,8 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 4. Load settings ────────────────────────────────────────────────────────
   const settings = await getOrCreateSettings(db);
-  const waConfig: WhatsAppRuntimeConfig | undefined = settings.whatsapp
-    ? {
-        token: settings.whatsapp.token,
-        phoneNumberId: settings.whatsapp.phoneNumberId,
-      }
-    : undefined;
+  const waConfig: WhatsAppRuntimeConfig | undefined =
+    resolveWhatsAppRuntimeConfig(settings);
   const qrConnected = getQrSnapshot().state === "connected";
 
   if (existingLead?.needsHuman) {

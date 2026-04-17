@@ -9,6 +9,8 @@
  *   messages are logged but NOT sent to WhatsApp.
  */
 
+import type { AutomationSettings } from "@/lib/models/settings";
+
 const GRAPH_API_VERSION = "v22.0";
 const BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
@@ -19,6 +21,28 @@ export type WaSendResult =
 export interface WhatsAppRuntimeConfig {
   token?: string;
   phoneNumberId?: string;
+}
+
+/**
+ * Credentials for Graph API sends. When both env vars are set and not disabled,
+ * they win over dashboard-stored Mongo values so hosted deploys (e.g. Vercel)
+ * can rotate secrets without clearing the database.
+ */
+export function resolveWhatsAppRuntimeConfig(
+  settings: AutomationSettings
+): WhatsAppRuntimeConfig | undefined {
+  const envToken = process.env.WHATSAPP_TOKEN?.trim();
+  const envPhone = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim();
+  if (envToken && envPhone && !settings.whatsappEnvDisabled) {
+    return { token: envToken, phoneNumberId: envPhone };
+  }
+  if (settings.whatsapp?.token && settings.whatsapp.phoneNumberId) {
+    return {
+      token: settings.whatsapp.token,
+      phoneNumberId: settings.whatsapp.phoneNumberId,
+    };
+  }
+  return undefined;
 }
 
 // ── Internal config ────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ import { getDb } from "@/lib/mongodb";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { leadsCollection } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
-import { sendTextMessage, type WhatsAppRuntimeConfig } from "@/lib/whatsapp";
+import { resolveWhatsAppRuntimeConfig, sendTextMessage, type WhatsAppRuntimeConfig } from "@/lib/whatsapp";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
 
 export async function POST(req: NextRequest) {
@@ -18,12 +18,8 @@ export async function POST(req: NextRequest) {
 
     const db = await getDb();
     const settings = await getOrCreateSettings(db);
-    const waConfig: WhatsAppRuntimeConfig | undefined = settings.whatsapp
-      ? {
-          token: settings.whatsapp.token,
-          phoneNumberId: settings.whatsapp.phoneNumberId,
-        }
-      : undefined;
+    const waConfig: WhatsAppRuntimeConfig | undefined =
+      resolveWhatsAppRuntimeConfig(settings);
 
     const messagesCol = waMessagesCollection(db);
     const leadsCol = leadsCollection(db);
