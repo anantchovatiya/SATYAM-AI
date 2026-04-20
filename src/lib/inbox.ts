@@ -1,51 +1,30 @@
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
-import { getOrCreateSettings } from "@/lib/models/settings";
-import { getQrSnapshot } from "@/lib/whatsapp-qr-connector";
 import {
   canonicalWaContactKey,
   formatLeadPhoneFromCanonical,
 } from "@/lib/wa-phone";
 import type { Contact, ChatMessage, MessageChannel } from "@/lib/chat-data";
 
-async function getActiveChannel(): Promise<MessageChannel | "all"> {
-  const db = await getDb();
-  const settings = await getOrCreateSettings(db);
-
-  const hasStoredConnection = Boolean(
-    settings.whatsapp?.token && settings.whatsapp.phoneNumberId
-  );
-  const hasEnvConnection = Boolean(
-    process.env.WHATSAPP_TOKEN &&
-      process.env.WHATSAPP_PHONE_NUMBER_ID &&
-      !settings.whatsappEnvDisabled
-  );
-  const qrConnected = getQrSnapshot().state === "connected";
-
-  if (hasStoredConnection || hasEnvConnection) return "api";
-  if (qrConnected) return "qr";
-  return "all";
-}
-
+/**
+ * Inbox loads messages from both Cloud API and QR-linked sessions.
+ *
+ * Do not filter by "active channel" here: `getQrSnapshot()` only reflects QR
+ * state inside the same long-lived Node process (e.g. `next dev`). On Vercel,
+ * serverless invocations have no QR socket, and env-based "api" mode would hide
+ * all QR-stored messages — causing different data than localhost and a visible
+ * jump when the client poll replaces SSR data.
+ */
 export async function getInboxContacts(limitMessages = 1500): Promise<Contact[]> {
   const db = await getDb();
   const lCol = leadsCollection(db);
   const mCol = waMessagesCollection(db);
 
-  const activeChannel = await getActiveChannel();
-
-  const channelFilter =
-    activeChannel === "qr"
-      ? { phoneNumberId: "qr-linked" }
-      : activeChannel === "api"
-      ? { phoneNumberId: { $ne: "qr-linked" } }
-      : {};
-
   const [leads, messages] = await Promise.all([
     lCol.find({}).sort({ updatedAt: -1 }).toArray(),
     mCol
-      .find(channelFilter)
+      .find({})
       .sort({ timestamp: -1 })
       .limit(limitMessages)
       .toArray(),
@@ -128,11 +107,6 @@ export async function getInboxContacts(limitMessages = 1500): Promise<Contact[]>
   }
 
   const fromLead: Contact[] = leads
-    .filter((lead) => {
-      if (activeChannel === "all") return true;
-      const k = canonicalWaContactKey(lead.phone);
-      return Boolean(k && msgByPhone[k]?.length);
-    })
     .map((lead) => {
       const key = canonicalWaContactKey(lead.phone);
       return buildContact(lead._id!.toHexString(), lead.name, lead.phone, key, lead);
