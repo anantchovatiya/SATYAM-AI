@@ -42,6 +42,11 @@ import { analyzeChat, generateReply } from "@/lib/ai";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
+import {
+  findLeadByCanonicalPhone,
+  formatLeadPhoneFromRaw,
+  mongoMatchStoredWaFrom,
+} from "@/lib/wa-phone";
 
 // ── GET — Meta webhook verification ──────────────────────────────────────────
 
@@ -71,6 +76,23 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({ error: "Verification failed" }, { status: 403 });
 }
 
+function countWebhookIncomingMessages(body: unknown): number {
+  try {
+    const b = body as {
+      entry?: { changes?: { value?: { messages?: unknown[] } }[] }[];
+    };
+    let n = 0;
+    for (const e of b.entry ?? []) {
+      for (const c of e.changes ?? []) {
+        n += c.value?.messages?.length ?? 0;
+      }
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
 // ── POST — incoming message pipeline ──────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
@@ -85,10 +107,19 @@ export async function POST(req: NextRequest) {
 
   const messages = parseWebhookPayload(rawBody);
 
-  // Meta expects a 200 quickly — process asynchronously
   if (messages.length === 0) {
+    const rawCount = countWebhookIncomingMessages(rawBody);
+    if (rawCount > 0) {
+      console.warn(
+        "[WhatsApp Webhook] Meta sent",
+        rawCount,
+        "message(s) but none were parsed (unsupported type or empty body). Check extractInboundTextFromWebhookMessage."
+      );
+    }
     return NextResponse.json({ ok: true, processed: 0 });
   }
+
+  console.log("[WhatsApp Webhook] Parsed inbound count:", messages.length);
 
   const db = await getDb();
   await ensureIndexes(db).catch(() => {}); // best-effort index creation
@@ -138,12 +169,12 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 2. Upsert lead by phone ─────────────────────────────────────────────────
   const t2 = Date.now();
-  const normalizedPhone = normalizePhone(msg.from);
+  const displayPhone = formatLeadPhoneFromRaw(msg.from);
 
-  const existingLead = await leadsCol.findOne({ phone: normalizedPhone });
+  const existingLead = await findLeadByCanonicalPhone(leadsCol, msg.from);
   let leadId: string;
   let leadName: string;
-  const leadFilter = existingLead ? { _id: existingLead._id } : { phone: normalizedPhone };
+  const leadFilter = existingLead ? { _id: existingLead._id } : { phone: displayPhone };
 
   if (existingLead) {
     leadId   = existingLead._id!.toHexString();
@@ -165,7 +196,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     const now = new Date();
     const result = await leadsCol.insertOne({
       name:          msg.senderName,
-      phone:         normalizedPhone,
+      phone:         displayPhone,
       source:        "WhatsApp",
       status:        "New",
       conversationStatus: "new_inquiry",
@@ -179,7 +210,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     });
     leadId   = result.insertedId.toHexString();
     leadName = msg.senderName;
-    addEvent("lead_created", { leadId, leadName, phone: normalizedPhone }, Date.now() - t2);
+    addEvent("lead_created", { leadId, leadName, phone: displayPhone }, Date.now() - t2);
   }
 
   // ── 3. Claim inbound message atomically (idempotency lock) ──────────────────
@@ -236,7 +267,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 5. Fetch recent conversation for context ────────────────────────────────
   const recentMessages = await messagesCol
-    .find({ from: msg.from })
+    .find(mongoMatchStoredWaFrom(msg.from))
     .sort({ timestamp: -1 })
     .limit(20)
     .toArray();
@@ -322,7 +353,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   }
 
   const alreadyReplied = await messagesCol.findOne({
-    from: msg.from,
+    ...mongoMatchStoredWaFrom(msg.from),
     direction: "out",
     timestamp: { $gte: msg.timestamp },
   });
@@ -359,7 +390,17 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   let sendResult: Awaited<ReturnType<typeof sendTextMessage>>;
   let sendChannel: "cloud" | "qr";
 
-  if (qrConnected) {
+  if (cloudConfigured) {
+    sendResult = await sendTextMessage(msg.from, safeReplyText, waConfig);
+    sendChannel = "cloud";
+    if ((!sendResult.ok || sendResult.mode === "dry-run") && qrConnected) {
+      const qrSend = await sendQrTextMessage(msg.from, safeReplyText);
+      if (qrSend.ok) {
+        sendResult = { ok: true, messageId: qrSend.messageId, mode: "live" };
+        sendChannel = "qr";
+      }
+    }
+  } else if (qrConnected) {
     const qrSend = await sendQrTextMessage(msg.from, safeReplyText);
     if (qrSend.ok) {
       sendResult = { ok: true, messageId: qrSend.messageId, mode: "live" };
@@ -371,13 +412,6 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   } else {
     sendResult = await sendTextMessage(msg.from, replyResult.reply, waConfig);
     sendChannel = "cloud";
-    if ((sendResult.ok && sendResult.mode === "dry-run") || !sendResult.ok) {
-      const qrSend = await sendQrTextMessage(msg.from, safeReplyText);
-      if (qrSend.ok) {
-        sendResult = { ok: true, messageId: qrSend.messageId, mode: "live" };
-        sendChannel = "qr";
-      }
-    }
   }
 
   if ((!sendResult.ok || sendResult.mode === "dry-run") && !cloudConfigured && qrConnected) {
@@ -487,16 +521,6 @@ async function persistLog({
     createdAt:   now,
     updatedAt:   now,
   }).catch((e) => console.error("[Webhook] Failed to persist log:", e));
-}
-
-function normalizePhone(raw: string): string {
-  // WhatsApp sends numbers without '+', e.g. "919810011223"
-  // Normalise to "+91 98100 11223" style for matching leads
-  const digits = raw.replace(/\D/g, "");
-  if (digits.length === 12 && digits.startsWith("91")) {
-    return `+${digits.slice(0, 2)} ${digits.slice(2, 7)} ${digits.slice(7)}`;
-  }
-  return `+${digits}`;
 }
 
 function coerceCompleteReply(reply: string, leadName: string): string {

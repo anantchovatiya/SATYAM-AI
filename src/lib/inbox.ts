@@ -3,9 +3,12 @@ import { leadsCollection } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { getQrSnapshot } from "@/lib/whatsapp-qr-connector";
+import {
+  canonicalWaContactKey,
+  formatLeadPhoneFromCanonical,
+} from "@/lib/wa-phone";
 import type { Contact, ChatMessage, MessageChannel } from "@/lib/chat-data";
 
-/** Determine which channel is currently active based on connection priority. */
 async function getActiveChannel(): Promise<MessageChannel | "all"> {
   const db = await getDb();
   const settings = await getOrCreateSettings(db);
@@ -25,14 +28,13 @@ async function getActiveChannel(): Promise<MessageChannel | "all"> {
   return "all";
 }
 
-export async function getInboxContacts(limitMessages = 300): Promise<Contact[]> {
+export async function getInboxContacts(limitMessages = 1500): Promise<Contact[]> {
   const db = await getDb();
   const lCol = leadsCollection(db);
   const mCol = waMessagesCollection(db);
 
   const activeChannel = await getActiveChannel();
 
-  // Build the message filter: only fetch messages from the active connection.
   const channelFilter =
     activeChannel === "qr"
       ? { phoneNumberId: "qr-linked" }
@@ -50,14 +52,24 @@ export async function getInboxContacts(limitMessages = 300): Promise<Contact[]> 
   ]);
 
   const msgByPhone: Record<string, ChatMessage[]> = {};
+  const lastTsByKey: Record<string, number> = {};
+  const nameByKey: Record<string, string> = {};
   const seenMessageIds = new Set<string>();
+
   for (const m of messages) {
     if (seenMessageIds.has(m.waMessageId)) continue;
     seenMessageIds.add(m.waMessageId);
 
-    const key = String(m.from).replace(/\D/g, "");
+    const key = canonicalWaContactKey(m.from);
     if (!key) continue;
     if (!msgByPhone[key]) msgByPhone[key] = [];
+
+    const ts = new Date(m.timestamp).getTime();
+    if (!lastTsByKey[key] || ts > lastTsByKey[key]) lastTsByKey[key] = ts;
+
+    if (m.direction === "in" && m.senderName?.trim() && !nameByKey[key]) {
+      nameByKey[key] = m.senderName.trim();
+    }
 
     const d = new Date(m.timestamp);
     const today = new Date();
@@ -83,35 +95,65 @@ export async function getInboxContacts(limitMessages = 300): Promise<Contact[]> 
     });
   }
 
-  return leads
+  const leadKeys = new Set(
+    leads.map((l) => canonicalWaContactKey(l.phone)).filter(Boolean)
+  );
+
+  function buildContact(
+    id: string,
+    name: string,
+    phone: string,
+    key: string,
+    lead?: (typeof leads)[0]
+  ): Contact {
+    const msgs = (msgByPhone[key] ?? []).slice().reverse();
+    return {
+      id,
+      name,
+      phone,
+      source: lead?.source ?? "WhatsApp",
+      status: lead?.status ?? "New",
+      conversationStatus: lead?.conversationStatus,
+      needsHuman: lead?.needsHuman ?? false,
+      pendingHumanReply:
+        Boolean(lead?.needsHuman) ||
+        lead?.conversationStatus === "escalated" ||
+        lead?.conversationStatus === "awaiting_team_reply",
+      assignedTo: lead?.assignedTo ?? "Unassigned",
+      online: false,
+      unread: msgs.some((m) => m.direction === "in") ? 1 : 0,
+      messages: msgs,
+      notes: [],
+    };
+  }
+
+  const fromLead: Contact[] = leads
     .filter((lead) => {
-      // When a specific channel is active, only show leads that have at least
-      // one message from that channel — prevents ghost contacts from the other
-      // connection appearing in the list.
       if (activeChannel === "all") return true;
-      const key = lead.phone.replace(/\D/g, "");
-      return Boolean(msgByPhone[key]?.length);
+      const k = canonicalWaContactKey(lead.phone);
+      return Boolean(k && msgByPhone[k]?.length);
     })
     .map((lead) => {
-      const key = lead.phone.replace(/\D/g, "");
-      const msgs = (msgByPhone[key] ?? []).reverse();
-      return {
-        id: lead._id!.toHexString(),
-        name: lead.name,
-        phone: lead.phone,
-        source: lead.source,
-        status: lead.status,
-        conversationStatus: lead.conversationStatus,
-        needsHuman: lead.needsHuman ?? false,
-        pendingHumanReply:
-          Boolean(lead.needsHuman) ||
-          lead.conversationStatus === "escalated" ||
-          lead.conversationStatus === "awaiting_team_reply",
-        assignedTo: lead.assignedTo,
-        online: false,
-        unread: msgs.some((m) => m.direction === "in") ? 1 : 0,
-        messages: msgs,
-        notes: [],
-      } as Contact;
+      const key = canonicalWaContactKey(lead.phone);
+      return buildContact(lead._id!.toHexString(), lead.name, lead.phone, key, lead);
     });
+
+  const orphanKeys = Object.keys(msgByPhone).filter((k) => !leadKeys.has(k));
+  const fromOrphan: Contact[] = orphanKeys.map((key) =>
+    buildContact(
+      `__orphan_${key}`,
+      nameByKey[key] ?? formatLeadPhoneFromCanonical(key),
+      formatLeadPhoneFromCanonical(key),
+      key
+    )
+  );
+
+  const combined = [...fromLead, ...fromOrphan];
+  combined.sort((a, b) => {
+    const ka = canonicalWaContactKey(a.phone);
+    const kb = canonicalWaContactKey(b.phone);
+    return (lastTsByKey[kb] ?? 0) - (lastTsByKey[ka] ?? 0);
+  });
+
+  return combined;
 }

@@ -10,6 +10,7 @@
  */
 
 import type { AutomationSettings } from "@/lib/models/settings";
+import { canonicalWaContactKey } from "@/lib/wa-phone";
 
 const GRAPH_API_VERSION = "v22.0";
 const BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
@@ -54,6 +55,10 @@ function getConfig(override?: WhatsAppRuntimeConfig) {
   return { token, phoneNumberId, dryRun };
 }
 
+export function normalizeWhatsAppRecipientId(phone: string): string {
+  return phone.replace(/\D/g, "");
+}
+
 // ── Send a text message ────────────────────────────────────────────────────────
 
 export async function sendTextMessage(
@@ -71,6 +76,11 @@ export async function sendTextMessage(
     return { ok: true, messageId: `dry-run-${Date.now()}`, mode: "dry-run" };
   }
 
+  const toDigits = normalizeWhatsAppRecipientId(to);
+  if (!toDigits) {
+    return { ok: false, error: "Invalid recipient: country code + number (digits only).", mode: "live" };
+  }
+
   try {
     const res = await fetch(`${BASE_URL}/${phoneNumberId}/messages`, {
       method: "POST",
@@ -81,7 +91,7 @@ export async function sendTextMessage(
       body: JSON.stringify({
         messaging_product: "whatsapp",
         recipient_type:    "individual",
-        to,
+        to: toDigits,
         type:              "text",
         text:              { preview_url: false, body },
       }),
@@ -119,6 +129,11 @@ export async function sendTemplateMessage(
     return { ok: true, messageId: `dry-run-tmpl-${Date.now()}`, mode: "dry-run" };
   }
 
+  const toDigits = normalizeWhatsAppRecipientId(to);
+  if (!toDigits) {
+    return { ok: false, error: "Invalid recipient for template.", mode: "live" };
+  }
+
   try {
     const res = await fetch(`${BASE_URL}/${phoneNumberId}/messages`, {
       method: "POST",
@@ -128,7 +143,7 @@ export async function sendTemplateMessage(
       },
       body: JSON.stringify({
         messaging_product: "whatsapp",
-        to,
+        to: toDigits,
         type:     "template",
         template: { name: templateName, language: { code: languageCode }, components },
       }),
@@ -177,6 +192,91 @@ export interface ParsedWaMessage {
   phoneNumberId: string;
 }
 
+type WebhookMessage = {
+  id: string;
+  from: string;
+  timestamp: string;
+  type: string;
+  text?: { body?: string };
+  image?: { caption?: string };
+  video?: { caption?: string };
+  audio?: { mime_type?: string };
+  voice?: { mime_type?: string };
+  document?: { caption?: string; filename?: string };
+  sticker?: { mime_type?: string };
+  button?: { text?: string; payload?: string };
+  interactive?: {
+    type?: string;
+    button_reply?: { id?: string; title?: string };
+    list_reply?: { id?: string; title?: string; description?: string };
+  };
+  location?: { name?: string; address?: string };
+  contacts?: unknown;
+  reaction?: { emoji?: string };
+  system?: { body?: string; type?: string };
+};
+
+export function extractInboundTextFromWebhookMessage(msg: WebhookMessage): string | null {
+  switch (msg.type) {
+    case "text": {
+      const body = msg.text?.body?.trim();
+      return body && body.length > 0 ? body : null;
+    }
+    case "image": {
+      const cap = msg.image?.caption?.trim();
+      return cap && cap.length > 0 ? cap : "[Image]";
+    }
+    case "video": {
+      const cap = msg.video?.caption?.trim();
+      return cap && cap.length > 0 ? cap : "[Video]";
+    }
+    case "audio":
+    case "voice":
+      return "[Voice message]";
+    case "document": {
+      const cap = msg.document?.caption?.trim();
+      const fn = msg.document?.filename?.trim();
+      if (cap && cap.length > 0) return cap;
+      if (fn && fn.length > 0) return `[Document: ${fn}]`;
+      return "[Document]";
+    }
+    case "sticker":
+      return "[Sticker]";
+    case "button": {
+      const t = msg.button?.text?.trim() || msg.button?.payload?.trim();
+      return t && t.length > 0 ? t : "[Button]";
+    }
+    case "interactive": {
+      const br = msg.interactive?.button_reply?.title?.trim();
+      if (br) return br;
+      const lr = msg.interactive?.list_reply?.title?.trim();
+      if (lr) return lr;
+      return "[Interactive reply]";
+    }
+    case "location": {
+      const name = msg.location?.name?.trim();
+      const addr = msg.location?.address?.trim();
+      if (name && addr) return `${name} — ${addr}`;
+      if (name) return name;
+      if (addr) return addr;
+      return "[Location]";
+    }
+    case "contacts":
+      return "[Contact card]";
+    case "reaction": {
+      const em = msg.reaction?.emoji?.trim();
+      return em ? `[Reaction: ${em}]` : "[Reaction]";
+    }
+    case "system":
+      return msg.system?.body?.trim() || "[System]";
+    case "unsupported":
+    case "unknown":
+      return null;
+    default:
+      return `[${msg.type}]`;
+  }
+}
+
 export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
   const results: ParsedWaMessage[] = [];
 
@@ -189,13 +289,7 @@ export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
           value: {
             metadata:    { phone_number_id: string };
             contacts?:   { profile: { name: string }; wa_id: string }[];
-            messages?:   {
-              id:        string;
-              from:      string;
-              timestamp: string;
-              type:      string;
-              text?:     { body: string };
-            }[];
+            messages?:   WebhookMessage[];
           };
         }[];
       }[];
@@ -210,17 +304,24 @@ export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
         const { value } = change;
         const phoneNumberId = value.metadata?.phone_number_id ?? "";
 
-        for (const msg of value.messages ?? []) {
-          if (msg.type !== "text" || !msg.text?.body) continue;
+        for (const raw of value.messages ?? []) {
+          const msg = raw as WebhookMessage;
+          if (!msg?.id || !msg.from || !msg.timestamp) continue;
+
+          const text = extractInboundTextFromWebhookMessage(msg);
+          if (!text) continue;
 
           const contact = value.contacts?.find((c) => c.wa_id === msg.from);
 
+          const fromCanon = canonicalWaContactKey(msg.from);
+          if (!fromCanon) continue;
+
           results.push({
-            waMessageId:   msg.id,
-            from:          msg.from,
-            senderName:    contact?.profile?.name ?? msg.from,
-            text:          msg.text.body,
-            timestamp:     new Date(Number(msg.timestamp) * 1000),
+            waMessageId: msg.id,
+            from: fromCanon,
+            senderName: contact?.profile?.name ?? msg.from,
+            text,
+            timestamp: new Date(Number(msg.timestamp) * 1000),
             phoneNumberId,
           });
         }

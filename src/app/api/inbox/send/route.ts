@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { getOrCreateSettings } from "@/lib/models/settings";
-import { leadsCollection } from "@/lib/models/lead";
+import { leadsCollection, type LeadDoc } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
-import { resolveWhatsAppRuntimeConfig, sendTextMessage, type WhatsAppRuntimeConfig } from "@/lib/whatsapp";
+import {
+  normalizeWhatsAppRecipientId,
+  resolveWhatsAppRuntimeConfig,
+  sendTextMessage,
+  type WhatsAppRuntimeConfig,
+} from "@/lib/whatsapp";
+import {
+  canonicalWaContactKey,
+  findLeadByCanonicalPhone,
+  formatLeadPhoneFromRaw,
+} from "@/lib/wa-phone";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
 
 export async function POST(req: NextRequest) {
@@ -29,35 +39,28 @@ export async function POST(req: NextRequest) {
     let sendResult: Awaited<ReturnType<typeof sendTextMessage>>;
     let channel: "cloud" | "qr";
 
-    if (qrConnected) {
-      const qr = await sendQrTextMessage(qrTarget, text);
-      if (qr.ok) {
-        sendResult = { ok: true, messageId: qr.messageId, mode: "live" };
-        channel = "qr";
-      } else {
-        sendResult = await sendTextMessage(to, text, waConfig);
-        channel = "cloud";
-      }
-      if ((!sendResult.ok || sendResult.mode === "dry-run") && !cloudConfigured) {
-        return NextResponse.json(
-          {
-            error: "QR send failed and Cloud API is not configured.",
-            mode: sendResult.mode,
-            channel: "qr",
-          },
-          { status: 500 }
-        );
-      }
-    } else {
+    if (cloudConfigured) {
       sendResult = await sendTextMessage(to, text, waConfig);
       channel = "cloud";
-      if ((sendResult.ok && sendResult.mode === "dry-run") || !sendResult.ok) {
+      if ((!sendResult.ok || sendResult.mode === "dry-run") && qrConnected) {
         const qr = await sendQrTextMessage(qrTarget, text);
         if (qr.ok) {
           sendResult = { ok: true, messageId: qr.messageId, mode: "live" };
           channel = "qr";
         }
       }
+    } else if (qrConnected) {
+      const qr = await sendQrTextMessage(qrTarget, text);
+      if (qr.ok) {
+        sendResult = { ok: true, messageId: qr.messageId, mode: "live" };
+        channel = "qr";
+      } else {
+        sendResult = { ok: false, error: qr.error, mode: "live" };
+        channel = "qr";
+      }
+    } else {
+      sendResult = await sendTextMessage(to, text, waConfig);
+      channel = "cloud";
     }
 
     if (!sendResult.ok || sendResult.mode === "dry-run") {
@@ -74,14 +77,14 @@ export async function POST(req: NextRequest) {
     }
 
     const now = new Date();
-    const fromDigits = to.replace(/\D/g, "");
+    const fromKey = canonicalWaContactKey(to) || normalizeWhatsAppRecipientId(to);
 
     await messagesCol.updateOne(
       { waMessageId: sendResult.messageId },
       {
         $setOnInsert: {
           waMessageId: sendResult.messageId,
-          from: fromDigits || to,
+          from: fromKey,
           senderName: "SATYAM AI",
           text,
           timestamp: now,
@@ -92,7 +95,25 @@ export async function POST(req: NextRequest) {
       { upsert: true }
     );
 
-    const lead = await leadsCol.findOne({ phone: normalizePhone(to) });
+    let lead: LeadDoc | null = await findLeadByCanonicalPhone(leadsCol, to);
+    if (!lead) {
+      const display = formatLeadPhoneFromRaw(to);
+      const ins = await leadsCol.insertOne({
+        name: display,
+        phone: display,
+        source: "WhatsApp",
+        status: "New",
+        conversationStatus: "awaiting_customer_reply",
+        lastMessage: text,
+        interestScore: 50,
+        assignedTo: "Unassigned",
+        lastFollowup: "Just now",
+        lastOutboundAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+      lead = await leadsCol.findOne({ _id: ins.insertedId });
+    }
     if (lead) {
       await leadsCol.updateOne(
         { _id: lead._id },
@@ -110,6 +131,10 @@ export async function POST(req: NextRequest) {
     }
 
     const targetUsed = channel === "qr" ? qrTarget : to;
+    const recipientDigits =
+      channel === "cloud"
+        ? normalizeWhatsAppRecipientId(to)
+        : normalizeWhatsAppRecipientId(String(qrTarget));
 
     return NextResponse.json({
       ok: true,
@@ -123,6 +148,7 @@ export async function POST(req: NextRequest) {
       },
       channel,
       targetUsed,
+      recipientDigits,
       messageId: sendResult.messageId,
       mode: sendResult.mode,
     });
@@ -132,14 +158,6 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-function normalizePhone(raw: string): string {
-  const digits = raw.replace(/\D/g, "");
-  if (digits.length === 12 && digits.startsWith("91")) {
-    return `+${digits.slice(0, 2)} ${digits.slice(2, 7)} ${digits.slice(7)}`;
-  }
-  return `+${digits}`;
 }
 
 async function resolveQrRecipient(
