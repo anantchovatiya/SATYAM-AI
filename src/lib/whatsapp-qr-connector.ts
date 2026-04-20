@@ -45,6 +45,21 @@ type SocketType = {
 
 const CATALOGUE_PDF = path.join(process.cwd(), "public", "AgriBird Brochure.pdf");
 
+/** Directory for Baileys `useMultiFileAuthState`. Returns `null` when the host cannot persist auth (e.g. Vercel). */
+function getWaAuthDir(): string | null {
+  const disabled = process.env.WA_DISABLE_QR === "1" || process.env.WA_DISABLE_QR === "true";
+  if (disabled) return null;
+  const override = process.env.WA_AUTH_DIR?.trim();
+  if (override) return path.resolve(override);
+  if (process.env.VERCEL === "1") return null;
+  if (process.env.AWS_LAMBDA_FUNCTION_NAME) return null;
+  if (process.env.NETLIFY === "true") return null;
+  return path.join(process.cwd(), ".wa-auth", "default");
+}
+
+const QR_UNSUPPORTED_HOST_ERROR =
+  "WhatsApp QR (Baileys) needs a writable filesystem and is not supported on this host (for example Vercel serverless). Connect using the Meta Cloud API in the dashboard, or deploy the app on a VPS, Railway, or Fly.io where session files can be stored.";
+
 interface QrConnectorStore {
   socket: SocketType | null;
   status: QrSnapshot;
@@ -662,8 +677,6 @@ async function runQrAutoReplySweep(limit = 10) {
 }
 
 
-const AUTH_DIR = path.join(process.cwd(), ".wa-auth", "default");
-
 async function stopSocket(clearAuth = false) {
   const store = getStore();
   if (store.autoReplyTimer) {
@@ -689,7 +702,8 @@ async function stopSocket(clearAuth = false) {
   store.socket = null;
 
   if (clearAuth) {
-    await rm(AUTH_DIR, { recursive: true, force: true }).catch(() => {});
+    const authDir = getWaAuthDir();
+    if (authDir) await rm(authDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -715,6 +729,16 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
     return store.booting;
   }
 
+  const authDir = getWaAuthDir();
+  if (!authDir) {
+    setStatus({
+      state: "error",
+      qrDataUrl: null,
+      error: QR_UNSUPPORTED_HOST_ERROR,
+    });
+    return store.status;
+  }
+
   store.booting = (async () => {
     try {
       setStatus({ state: "connecting", qrDataUrl: null, error: null });
@@ -738,7 +762,19 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
         throw new Error("QR encoder unavailable");
       }
 
-      const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      let state: Awaited<ReturnType<typeof useMultiFileAuthState>>["state"];
+      let saveCreds: Awaited<ReturnType<typeof useMultiFileAuthState>>["saveCreds"];
+      try {
+        const auth = await useMultiFileAuthState(authDir);
+        state = auth.state;
+        saveCreds = auth.saveCreds;
+      } catch (err) {
+        const code = err instanceof Error && "code" in err ? (err as NodeJS.ErrnoException).code : undefined;
+        if (code === "EROFS" || code === "EACCES" || code === "EPERM") {
+          throw new Error(QR_UNSUPPORTED_HOST_ERROR);
+        }
+        throw err;
+      }
       const { version } = await fetchLatestBaileysVersion();
 
       const sock = makeWASocket({
@@ -751,7 +787,23 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
       });
 
       store.socket = sock as unknown as SocketType;
-      sock.ev.on("creds.update", saveCreds);
+      sock.ev.on("creds.update", () => {
+        void Promise.resolve(saveCreds()).catch((err) => {
+          console.error("[wa-qr] saveCreds failed:", err);
+          const code =
+            err instanceof Error && "code" in err ? (err as NodeJS.ErrnoException).code : undefined;
+          setStatus({
+            state: "error",
+            qrDataUrl: null,
+            error:
+              code === "EROFS" || code === "EACCES" || code === "EPERM"
+                ? QR_UNSUPPORTED_HOST_ERROR
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+        });
+      });
 
       sock.ev.on("messages.upsert", ({ messages }) => {
         const store = getStore();
