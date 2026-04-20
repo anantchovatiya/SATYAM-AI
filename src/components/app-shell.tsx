@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, Bot, LayoutDashboard, Menu, MessageSquare, Settings2, Sparkles, Users, X } from "lucide-react";
+import { BarChart3, Bot, LayoutDashboard, Menu, MessageSquare, Mails, Settings2, Sparkles, Users, X } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/cn";
 import { ThemeToggle } from "./theme-toggle";
@@ -11,6 +11,7 @@ const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/leads", label: "Leads", icon: Users },
   { href: "/inbox", label: "Inbox", icon: MessageSquare },
+  { href: "/bulk-messages", label: "Bulk send", icon: Mails },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/automation", label: "Automation", icon: Sparkles },
   { href: "/followups", label: "Followups", icon: Bot },
