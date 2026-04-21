@@ -51,7 +51,7 @@ export function FollowupsClient({ followups, silentLeads, stats }: Props) {
         <div>
           <h1 className="text-2xl font-semibold">Followups</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Pending outreach tasks and silent leads
+            Important leads who have not messaged since their last chat (queued auto follow-up), manual tasks, and silent leads.
           </p>
         </div>
       </div>

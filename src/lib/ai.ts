@@ -5,6 +5,10 @@
  * 1) Gemini (GEMINI_API_KEY)
  * 2) OpenAI (OPENAI_API_KEY)
  * 3) Deterministic heuristic fallback
+ *
+ * Interest (`leadScore`): Gemini-only mini call on the last
+ * `INTEREST_SCORE_MESSAGE_WINDOW` messages; full `analyzeChat` also uses a dual-window
+ * prompt so the main model aligns `leadScore` with that window when Gemini/OpenAI run.
  */
 import OpenAI from "openai";
 
@@ -70,6 +74,23 @@ function getGeminiModel(): string {
 
 const GEMINI_QUOTA_COOLDOWN_MS = 5 * 60 * 1000;
 let geminiBlockedUntil = 0;
+
+function clampLeadScore0to100(n: number): number {
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function clampAnalyzeConfidence(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 0.72;
+  return Math.max(0.2, Math.min(1, n));
+}
+
+/** Model-only interest: use JSON leadScore when valid, else neutral placeholder (no keyword rules). */
+function leadScoreFromModelOrDefault(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 35;
+  return clampLeadScore0to100(n);
+}
 
 async function callGemini(args: {
   system: string;
@@ -168,6 +189,86 @@ const TONE_SYSTEM: Record<string, string> = {
     "You are a concise, authoritative advisor for a premium product. Responses should be brief, confident, and value-focused — no filler.",
 };
 
+/** Shown in analyzeChat system prompts so models align tiers and outbound context. */
+const LEAD_SCORE_RUBRIC = `leadScore (integer 0-100): buying strength for THIS lead from the FULL thread (LEAD + AGENT). Use AGENT lines for quantities, SKUs, prices, shipping, and order confirmation.
+Bands: 0-15 greetings or chit-chat only; 16-40 light product mentions without commitment; 41-60 product interest, specs, catalogue, "send details"; 61-78 pricing, MOQ, delivery, negotiation, piece/qty talk; 79-100 firm purchase intent or order step (confirm order, committed qty, invoice/payment, agent confirms their order). If the agent confirms an order or the lead commits qty/SKU, use at least 85 unless the lead clearly cancelled.
+IMPORTANT: If the RECENT lines are only from AGENT but they say the order is packed, shipping, dispatched, confirmed, payment received, out for delivery, or "getting your order ready" / similar fulfillment — that means an active sale; use leadScore 88–98 (not 30–45). Low scores are wrong when the business is clearly fulfilling an order for this chat.
+confidence (0-1): how sure you are; use roughly 0.85-1 when evidence is explicit (numbers, "confirm", "order", prices), and 0.45-0.7 when the thread is vague.`;
+
+/** Last N turns used for Gemini interest-only scoring and for the RECENT_WINDOW in analyzeChat. */
+export const INTEREST_SCORE_MESSAGE_WINDOW = 5;
+
+export function getLastMessagesForInterestScore(messages: IncomingMessage[]): IncomingMessage[] {
+  if (messages.length <= INTEREST_SCORE_MESSAGE_WINDOW) return messages;
+  return messages.slice(-INTEREST_SCORE_MESSAGE_WINDOW);
+}
+
+function formatChatLines(messages: IncomingMessage[]): string {
+  return messages
+    .map((m) => `[${m.direction === "in" ? "LEAD" : "AGENT"}] ${m.text}`)
+    .join("\n");
+}
+
+/** Agent said order is in fulfillment → floor score so UI is not stuck at neutral when Gemini under-reads AGENT-only tails. */
+const AGENT_FULFILLMENT_RE =
+  /\b(getting\s+your\s+order\s+packed|order\s+packed|packed\s+up|packed\s+up\s+and\s+ready|ready\s+to\s+go|on\s+the\s+way|out\s+for\s+delivery|dispatched|shipp(ed|ing)|your\s+order\s+(has\s+been\s+)?(shipped|dispatched|confirmed)|order\s+is\s+confirmed|payment\s+received|invoice\s+paid|tracking\s+(id|number|link))\b/i;
+
+/**
+ * Raise `score` when recent AGENT text clearly indicates order fulfillment (even if last messages are all outbound).
+ */
+export function applyAgentFulfillmentFloor(window: IncomingMessage[], score: number): number {
+  const base = clampLeadScore0to100(score);
+  const hit = window.some((m) => m.direction === "out" && AGENT_FULFILLMENT_RE.test(m.text ?? ""));
+  if (!hit) return base;
+  return Math.max(base, 88);
+}
+
+/** Dual-section transcript: model must base `leadScore` only on RECENT_WINDOW when present. */
+function buildDualWindowAnalyzePrompt(messages: IncomingMessage[]): string {
+  const last5 = getLastMessagesForInterestScore(messages);
+  if (messages.length <= INTEREST_SCORE_MESSAGE_WINDOW) {
+    return `Thread (${messages.length} message(s); use for all fields including leadScore):\n${formatChatLines(messages)}`;
+  }
+  return (
+    `===RECENT_WINDOW (last ${INTEREST_SCORE_MESSAGE_WINDOW} messages; leadScore MUST be inferred ONLY from this block)===\n` +
+    `${formatChatLines(last5)}\n\n` +
+    `===FULL_THREAD (${messages.length} messages; use for language, sentiment, stage, needsHuman, confidence)===\n` +
+    `${formatChatLines(messages)}`
+  );
+}
+
+/**
+ * Gemini-only: `leadScore` + `confidence` from the given slice (typically last 5 messages).
+ * Returns null if GEMINI_API_KEY is missing or the API fails.
+ */
+export async function geminiInterestScoreFromMessages(
+  recent: IncomingMessage[]
+): Promise<{ leadScore: number; confidence: number } | null> {
+  if (!getGeminiKey() || recent.length === 0) return null;
+  const text = await callGemini({
+    system: `You score B2B buying interest from WhatsApp-style lines. Return ONLY valid JSON with keys:
+leadScore (integer 0-100), confidence (number 0-1).
+${LEAD_SCORE_RUBRIC}`,
+    prompt: `Chronological messages (${recent.length}):\n${formatChatLines(recent)}`,
+    temperature: 0.2,
+    maxOutputTokens: 160,
+  });
+  if (!text) return null;
+  const raw = parseJsonFromText(text);
+  const leadScore = applyAgentFulfillmentFloor(recent, leadScoreFromModelOrDefault(raw.leadScore));
+  const confidence = clampAnalyzeConfidence(raw.confidence);
+  return { leadScore, confidence };
+}
+
+/** Clamped 0–100; 35 when Gemini is unavailable or fails. */
+export async function resolveGeminiLeadScoreLast5(messages: IncomingMessage[]): Promise<number> {
+  const slice = getLastMessagesForInterestScore(messages);
+  const w = slice.length ? slice : messages;
+  const g = await geminiInterestScoreFromMessages(w.length ? w : messages);
+  if (!g) return applyAgentFulfillmentFloor(w, 35);
+  return applyAgentFulfillmentFloor(w, g.leadScore);
+}
+
 // ── 1. analyzeChat ────────────────────────────────────────────────────────────
 
 export async function analyzeChat(
@@ -187,22 +288,24 @@ Return ONLY valid JSON with keys:
 language, sentiment, leadScore, stage, needsHuman, confidence.
 sentiment must be one of: positive|neutral|negative.
 stage must be one of: awareness|interest|consideration|intent|purchase|closed_won|closed_lost.
-needsHuman should be true for sensitive messages or if any of [${handoverKeywords.join(", ")}] appears.`,
-        prompt: `Conversation (${messages.length} messages):\n${messages
-          .map((m) => `[${m.direction === "in" ? "LEAD" : "AGENT"}] ${m.text}`)
-          .join("\n")}`,
+needsHuman should be true ONLY for abusive content, legal threats, refund/chargeback demands, or if any of [${handoverKeywords.join(", ")}] appears in the LEAD lines. Do NOT set needsHuman for normal product questions, requests for details/specs/quotes, or SKU choices.
+When the user prompt contains ===RECENT_WINDOW===, you MUST base leadScore ONLY on that block (not on older lines in FULL_THREAD).
+
+${LEAD_SCORE_RUBRIC}`,
+        prompt: buildDualWindowAnalyzePrompt(messages),
         temperature: 0.2,
         maxOutputTokens: 300,
       });
 
       if (text) {
         const raw = parseJsonFromText(text);
+        const interestWindow = getLastMessagesForInterestScore(messages);
         return {
           language: String(raw.language ?? "English"),
           sentiment: (["positive", "neutral", "negative"].includes(String(raw.sentiment))
             ? raw.sentiment
             : "neutral") as Sentiment,
-          leadScore: Number(raw.leadScore) || 50,
+          leadScore: applyAgentFulfillmentFloor(interestWindow, leadScoreFromModelOrDefault(raw.leadScore)),
           stage: ([
             "awareness",
             "interest",
@@ -215,7 +318,7 @@ needsHuman should be true for sensitive messages or if any of [${handoverKeyword
             ? raw.stage
             : "interest") as LeadStage,
           needsHuman: Boolean(raw.needsHuman),
-          confidence: Number(raw.confidence) || 0.8,
+          confidence: clampAnalyzeConfidence(raw.confidence),
           engine: "gemini",
         };
       }
@@ -236,28 +339,28 @@ needsHuman should be true for sensitive messages or if any of [${handoverKeyword
             content: `You are a CRM analytics engine. Analyse the provided lead conversation and return ONLY a JSON object with these exact keys:
 - language (string): detected spoken language, e.g. "English", "Hindi", "Spanish"
 - sentiment ("positive" | "neutral" | "negative")
-- leadScore (integer 0-100): buying intent, 0 = no interest, 100 = ready to buy
+- ${LEAD_SCORE_RUBRIC.replace(/\n/g, " ")}
 - stage ("awareness" | "interest" | "consideration" | "intent" | "purchase" | "closed_won" | "closed_lost")
-- needsHuman (boolean): true if any of [${handoverKeywords.join(", ")}] appear OR if the lead is angry/urgent
-- confidence (float 0-1): how certain you are of the analysis`,
+- needsHuman (boolean): true only if LEAD messages are abusive/threatening, demand refunds/chargebacks, or contain [${handoverKeywords.join(", ")}]. False for routine “send details / quote / specs” or SKU picks.
+- confidence (float 0-1): overall certainty of this JSON (see leadScore rubric for calibration).
+When the user message contains ===RECENT_WINDOW===, base leadScore ONLY on that section.`,
           },
           {
             role: "user",
-            content: `Conversation (${messages.length} messages):\n${messages
-              .map((m) => `[${m.direction === "in" ? "LEAD" : "AGENT"}] ${m.text}`)
-              .join("\n")}`,
+            content: buildDualWindowAnalyzePrompt(messages),
           },
         ],
       });
 
       const raw = JSON.parse(completion.choices[0].message.content ?? "{}");
+      const interestWindow = getLastMessagesForInterestScore(messages);
       return {
         language:    raw.language   ?? "English",
         sentiment:   raw.sentiment  ?? "neutral",
-        leadScore:   Number(raw.leadScore)  || 50,
+        leadScore:   applyAgentFulfillmentFloor(interestWindow, leadScoreFromModelOrDefault(raw.leadScore)),
         stage:       raw.stage      ?? "interest",
         needsHuman:  Boolean(raw.needsHuman),
-        confidence:  Number(raw.confidence) || 0.8,
+        confidence:  clampAnalyzeConfidence(raw.confidence),
         engine: "openai",
       };
     } catch {
@@ -265,7 +368,17 @@ needsHuman should be true for sensitive messages or if any of [${handoverKeyword
     }
   }
 
-  return heuristicAnalyze(fullText, messages, handoverKeywords);
+  const h = heuristicAnalyze(fullText, messages, handoverKeywords);
+  const ls = await resolveGeminiLeadScoreLast5(messages);
+  h.leadScore = ls;
+  const lower = fullText.toLowerCase();
+  if (lower.includes("cancel") || lower.includes("not interested")) h.stage = "closed_lost";
+  else if (ls >= 80) h.stage = "intent";
+  else if (ls >= 60) h.stage = "consideration";
+  else if (ls >= 35) h.stage = "interest";
+  else if (lower.includes("bought") || lower.includes("paid")) h.stage = "purchase";
+  else h.stage = "awareness";
+  return h;
 }
 
 // ── 2. generateReply ─────────────────────────────────────────────────────────
@@ -615,16 +728,9 @@ function heuristicAnalyze(
   // Needs human
   const needsHuman = handoverKeywords.some((kw) => lower.includes(kw.toLowerCase())) || sentiment === "negative";
 
-  // Lead score — based on message count, intent words, demo request
-  const intentWords = ["demo","call","meeting","schedule","trial","buy","purchase","plan","pricing","quote","proposal","interested","proceed"];
-  const intentHits = intentWords.filter((w) => lower.includes(w)).length;
-  const msgCount = messages.length;
-  const inboundCount = messages.filter((m) => m.direction === "in").length;
-  const responseRatio = msgCount > 0 ? inboundCount / msgCount : 0;
-  const rawScore = Math.min(100, intentHits * 15 + msgCount * 3 + responseRatio * 20 + posCount * 5);
-  const leadScore = Math.round(rawScore);
+  const leadScore = 35;
 
-  // Stage
+  // Stage (no LLM — keep conservative funnel position)
   let stage: LeadStage = "awareness";
   if (leadScore >= 80) stage = "intent";
   else if (leadScore >= 60) stage = "consideration";

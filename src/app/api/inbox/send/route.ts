@@ -14,10 +14,19 @@ import {
   findLeadByCanonicalPhone,
   formatLeadPhoneFromRaw,
 } from "@/lib/wa-phone";
+import { resolveQrRecipient } from "@/lib/wa-qr-recipient";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
+import { requireApiUser } from "@/lib/auth/session";
+import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
+import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 
 export async function POST(req: NextRequest) {
   try {
+    const auth = await requireApiUser(req);
+    if (auth instanceof Response) return auth;
+    const { userId } = auth;
+    const userIdHex = userId.toHexString();
+
     const body = (await req.json()) as { to?: string; text?: string };
     const to = String(body.to ?? "").trim();
     const text = String(body.text ?? "").trim();
@@ -27,15 +36,15 @@ export async function POST(req: NextRequest) {
     }
 
     const db = await getDb();
-    const settings = await getOrCreateSettings(db);
+    const settings = await getOrCreateSettings(db, userId);
     const waConfig: WhatsAppRuntimeConfig | undefined =
       resolveWhatsAppRuntimeConfig(settings);
 
     const messagesCol = waMessagesCollection(db);
     const leadsCol = leadsCollection(db);
-    const qrConnected = getQrSnapshot().state === "connected";
+    const qrConnected = getQrSnapshot(userIdHex).state === "connected";
     const cloudConfigured = Boolean(waConfig?.token && waConfig?.phoneNumberId);
-    const qrTarget = qrConnected ? await resolveQrRecipient(to, messagesCol) : to;
+    const qrTarget = qrConnected ? await resolveQrRecipient(to, userId, messagesCol) : to;
     let sendResult: Awaited<ReturnType<typeof sendTextMessage>>;
     let channel: "cloud" | "qr";
 
@@ -43,14 +52,14 @@ export async function POST(req: NextRequest) {
       sendResult = await sendTextMessage(to, text, waConfig);
       channel = "cloud";
       if ((!sendResult.ok || sendResult.mode === "dry-run") && qrConnected) {
-        const qr = await sendQrTextMessage(qrTarget, text);
+        const qr = await sendQrTextMessage(userIdHex, qrTarget, text);
         if (qr.ok) {
           sendResult = { ok: true, messageId: qr.messageId, mode: "live" };
           channel = "qr";
         }
       }
     } else if (qrConnected) {
-      const qr = await sendQrTextMessage(qrTarget, text);
+      const qr = await sendQrTextMessage(userIdHex, qrTarget, text);
       if (qr.ok) {
         sendResult = { ok: true, messageId: qr.messageId, mode: "live" };
         channel = "qr";
@@ -80,9 +89,10 @@ export async function POST(req: NextRequest) {
     const fromKey = canonicalWaContactKey(to) || normalizeWhatsAppRecipientId(to);
 
     await messagesCol.updateOne(
-      { waMessageId: sendResult.messageId },
+      { userId, waMessageId: sendResult.messageId },
       {
         $setOnInsert: {
+          userId,
           waMessageId: sendResult.messageId,
           from: fromKey,
           senderName: "SATYAM AI",
@@ -95,17 +105,18 @@ export async function POST(req: NextRequest) {
       { upsert: true }
     );
 
-    let lead: LeadDoc | null = await findLeadByCanonicalPhone(leadsCol, to);
+    let lead: LeadDoc | null = await findLeadByCanonicalPhone(leadsCol, userId, to);
     if (!lead) {
       const display = formatLeadPhoneFromRaw(to);
       const ins = await leadsCol.insertOne({
+        userId,
         name: display,
         phone: display,
         source: "WhatsApp",
         status: "New",
         conversationStatus: "awaiting_customer_reply",
         lastMessage: text,
-        interestScore: 50,
+        interestScore: 10,
         assignedTo: "Unassigned",
         lastFollowup: "Just now",
         lastOutboundAt: now,
@@ -129,6 +140,14 @@ export async function POST(req: NextRequest) {
         }
       );
     }
+
+    const leadAfterSend = lead?._id ? await leadsCol.findOne({ _id: lead._id }) : null;
+    if (leadAfterSend) {
+      await syncAutoFollowupQueueFromLead(db, userId, leadAfterSend, settings).catch(() => {});
+    }
+
+    const leadPhone = leadAfterSend?.phone ?? formatLeadPhoneFromRaw(to);
+    await refreshLeadInterestScoreFromWaThread(db, userId, fromKey, leadPhone).catch(() => {});
 
     const targetUsed = channel === "qr" ? qrTarget : to;
     const recipientDigits =
@@ -158,30 +177,4 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-async function resolveQrRecipient(
-  to: string,
-  messagesCol: ReturnType<typeof waMessagesCollection>
-): Promise<string> {
-  const digits = to.replace(/\D/g, "");
-  if (!digits) return to;
-
-  const recentByDigits = await messagesCol
-    .find({ from: { $regex: `^${digits}(?::\\d+)?$` } })
-    .sort({ timestamp: -1 })
-    .limit(5)
-    .toArray();
-
-  const withExactJid = recentByDigits.find((m) => typeof m.remoteJid === "string" && m.remoteJid.includes("@"));
-  if (withExactJid?.remoteJid) {
-    return withExactJid.remoteJid;
-  }
-
-  if (recentByDigits[0]?.from) {
-    const from = String(recentByDigits[0].from);
-    return from.includes(":") ? `${from}@lid` : from;
-  }
-
-  return to;
 }

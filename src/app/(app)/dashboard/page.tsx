@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { Flame, TrendingUp, Users, Zap, MessageSquare } from "lucide-react";
 import { MetricCard } from "@/components/metric-card";
 import { DbError } from "@/components/db-error";
@@ -7,6 +8,7 @@ import { leadsCollection } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { getBusinessCardCount } from "@/lib/business-card";
+import { getServerSessionUser } from "@/lib/auth/session";
 import { WhatsAppConnectionCard } from "./whatsapp-connection-card";
 import type { WhatsAppStatus } from "./whatsapp-connection-card";
 
@@ -28,25 +30,30 @@ const BAR_COLORS: Record<string, string> = {
 
 export default async function DashboardPage() {
   try {
-    const db  = await getDb();
+    const session = await getServerSessionUser();
+    if (!session) redirect("/login");
+    const { userId } = session;
+    const userIdHex = userId.toHexString();
+
+    const db = await getDb();
     const col = leadsCollection(db);
     const messagesCol = waMessagesCollection(db);
-    const settings = await getOrCreateSettings(db);
+    const settings = await getOrCreateSettings(db, userId);
 
     const [total, hot, silent, newCount, closedCount, recentDocs, totalMessages, contactPhones, latestMessage, totalWhatsAppLeads, businessCardsCollected] =
       await Promise.all([
-      col.countDocuments(),
-      col.countDocuments({ status: "Hot" }),
-      col.countDocuments({ status: "Silent" }),
-      col.countDocuments({ status: "New" }),
-      col.countDocuments({ status: "Closed" }),
-      col.find({}).sort({ createdAt: -1 }).limit(5).toArray(),
-      messagesCol.countDocuments(),
-      messagesCol.distinct("from"),
-      messagesCol.find({}).sort({ timestamp: -1 }).limit(1).toArray(),
-      col.countDocuments({ source: "WhatsApp" }),
-      getBusinessCardCount(),
-    ]);
+        col.countDocuments({ userId }),
+        col.countDocuments({ userId, status: "Hot" }),
+        col.countDocuments({ userId, status: "Silent" }),
+        col.countDocuments({ userId, status: "New" }),
+        col.countDocuments({ userId, status: "Closed" }),
+        col.find({ userId }).sort({ createdAt: -1 }).limit(5).toArray(),
+        messagesCol.countDocuments({ userId }),
+        messagesCol.distinct("from", { userId }),
+        messagesCol.find({ userId }).sort({ timestamp: -1 }).limit(1).toArray(),
+        col.countDocuments({ userId, source: "WhatsApp" }),
+        getBusinessCardCount(userIdHex),
+      ]);
 
     const convRate = total > 0 ? ((closedCount / total) * 100).toFixed(1) + "%" : "0%";
     const hotPct   = total > 0 ? Math.round((hot / total) * 100) : 0;

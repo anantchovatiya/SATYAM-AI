@@ -33,8 +33,6 @@ const ANGER_RE =
 export function shouldEscalateConversation(args: {
   latestText: string;
   keywords: string[];
-  analysisNeedsHuman: boolean;
-  sentiment?: "positive" | "neutral" | "negative";
 }): boolean {
   const text = args.latestText.trim();
   if (!text) return false;
@@ -42,9 +40,8 @@ export function shouldEscalateConversation(args: {
   if (hasSensitiveTopic(text, args.keywords)) return true;
   if (ANGER_RE.test(text)) return true;
 
-  // If model says human handover but content is short/neutral, do not escalate aggressively.
-  if (args.analysisNeedsHuman && args.sentiment === "negative" && text.split(/\s+/).length >= 3) {
-    return true;
-  }
+  // Do not escalate from model flags alone: models often set needsHuman/sentiment=negative for normal
+  // “send specs / give details / quote” requests. Handover stays keyword- and anger-driven only.
+
   return false;
 }

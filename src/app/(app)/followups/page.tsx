@@ -1,22 +1,28 @@
+import { redirect } from "next/navigation";
 import { getDb } from "@/lib/mongodb";
 import { followupsCollection, followupDocToRow } from "@/lib/models/followup";
 import { leadsCollection } from "@/lib/models/lead";
 import { DbError } from "@/components/db-error";
 import { FollowupsClient } from "./followups-client";
+import { getServerSessionUser } from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
 
 export default async function FollowupsPage() {
   try {
+    const session = await getServerSessionUser();
+    if (!session) redirect("/login");
+    const { userId } = session;
+
     const db  = await getDb();
     const fCol = followupsCollection(db);
     const lCol = leadsCollection(db);
 
     const [docs, silentLeads, pendingCount, doneCount] = await Promise.all([
-      fCol.find({}).sort({ dueDate: 1 }).toArray(),
-      lCol.find({ status: "Silent" }).sort({ updatedAt: 1 }).limit(20).toArray(),
-      fCol.countDocuments({ status: "Pending" }),
-      fCol.countDocuments({ status: "Done" }),
+      fCol.find({ userId }).sort({ dueDate: 1 }).toArray(),
+      lCol.find({ userId, status: "Silent" }).sort({ updatedAt: 1 }).limit(20).toArray(),
+      fCol.countDocuments({ userId, status: "Pending" }),
+      fCol.countDocuments({ userId, status: "Done" }),
     ]);
 
     const rows = docs.map(followupDocToRow);

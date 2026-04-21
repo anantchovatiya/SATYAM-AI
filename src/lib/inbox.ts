@@ -1,3 +1,4 @@
+import type { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
@@ -16,15 +17,15 @@ import type { Contact, ChatMessage, MessageChannel } from "@/lib/chat-data";
  * all QR-stored messages — causing different data than localhost and a visible
  * jump when the client poll replaces SSR data.
  */
-export async function getInboxContacts(limitMessages = 1500): Promise<Contact[]> {
+export async function getInboxContacts(userId: ObjectId, limitMessages = 1500): Promise<Contact[]> {
   const db = await getDb();
   const lCol = leadsCollection(db);
   const mCol = waMessagesCollection(db);
 
   const [leads, messages] = await Promise.all([
-    lCol.find({}).sort({ updatedAt: -1 }).toArray(),
+    lCol.find({ userId }).sort({ updatedAt: -1 }).toArray(),
     mCol
-      .find({})
+      .find({ userId })
       .sort({ timestamp: -1 })
       .limit(limitMessages)
       .toArray(),
@@ -86,6 +87,10 @@ export async function getInboxContacts(limitMessages = 1500): Promise<Contact[]>
     lead?: (typeof leads)[0]
   ): Contact {
     const msgs = (msgByPhone[key] ?? []).slice().reverse();
+    const last = msgs.at(-1);
+    // Unread = latest message is inbound (needs your attention). Any older inbound
+    // message would incorrectly stay "unread" forever after you reply.
+    const unread = last?.direction === "in" ? 1 : 0;
     return {
       id,
       name,
@@ -100,7 +105,7 @@ export async function getInboxContacts(limitMessages = 1500): Promise<Contact[]>
         lead?.conversationStatus === "awaiting_team_reply",
       assignedTo: lead?.assignedTo ?? "Unassigned",
       online: false,
-      unread: msgs.some((m) => m.direction === "in") ? 1 : 0,
+      unread,
       messages: msgs,
       notes: [],
     };

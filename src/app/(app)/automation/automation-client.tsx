@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import type { AutomationSettings, AiTone } from "@/lib/models/settings";
+import type { AutomationSettingsClient, AiTone } from "@/lib/models/settings";
 import { cn } from "@/lib/cn";
 import {
   Bot,
@@ -19,6 +19,7 @@ import {
   Zap,
   BookOpen,
   ExternalLink,
+  Gauge,
 } from "lucide-react";
 
 // ── Toggle switch ──────────────────────────────────────────────────────────────
@@ -167,9 +168,9 @@ function UnsavedDot() {
 export function AutomationClient({
   initial,
 }: {
-  initial: Omit<AutomationSettings, "_id">;
+  initial: AutomationSettingsClient;
 }) {
-  const [form, setForm] = useState<Omit<AutomationSettings, "_id">>(initial);
+  const [form, setForm] = useState<AutomationSettingsClient>(initial);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -303,6 +304,36 @@ export function AutomationClient({
               <span>7 days</span>
               <span>14 days</span>
             </div>
+          </div>
+
+          <div className="space-y-2 border-t border-slate-100 pt-4 dark:border-slate-800">
+            <label className="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-200">
+              <Gauge className="h-4 w-4 text-slate-400" />
+              Minimum interest for auto follow-up
+            </label>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Only send an automated follow-up when the lead&apos;s interest score is at least this value. Set to{" "}
+              <strong>0</strong> to include all leads. Example: require <strong>35</strong> after{" "}
+              {form.followUpDelayDays}d silence so only engaged contacts get nudged.
+            </p>
+            <div className="flex items-center gap-4">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={form.followUpMinInterestScore ?? 0}
+                onChange={(e) => set("followUpMinInterestScore", Number(e.target.value))}
+                className="h-2 flex-1 cursor-pointer appearance-none rounded-full bg-slate-200 accent-primary dark:bg-slate-700"
+              />
+              <div className="flex h-10 w-14 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-sm font-semibold dark:border-slate-700 dark:bg-slate-800">
+                {form.followUpMinInterestScore ?? 0}
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 dark:text-slate-500">
+              Score bands: hello ~10 · product / card / inquiry ~20–60 · price or qty ~60–80 · order intent ~80–100
+              (blended with AI on WhatsApp messages). The Follow-ups list shows “[Queue]” when the lead is above this
+              score and has not written again since their last message (you replied last); due date is that message + delay days.
+            </p>
           </div>
 
           {/* Human handover keywords */}

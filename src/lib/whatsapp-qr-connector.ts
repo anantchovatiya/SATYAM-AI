@@ -1,12 +1,15 @@
 import path from "node:path";
 import { rm, readFile } from "node:fs/promises";
 import { Boom } from "@hapi/boom";
+import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
-import { analyzeChat, generateReply } from "@/lib/ai";
+import { analyzeChat, generateReply, type IncomingMessage, type AnalyzeResult } from "@/lib/ai";
+import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
+import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
 /** Gemini Vision on inbound images — costs API. Set `true` to re-enable business-card scan + Excel. */
 const ENABLE_BUSINESS_CARD_IMAGE_SCAN = false;
@@ -28,7 +31,8 @@ export interface QrSnapshot {
 
 type WaMessageContent =
   | { text: string; linkPreview?: null }
-  | { document: Buffer; mimetype: string; fileName: string; caption?: string };
+  | { document: Buffer; mimetype: string; fileName: string; caption?: string }
+  | { image: Buffer; caption?: string };
 
 type SocketType = {
   logout: () => Promise<void>;
@@ -45,16 +49,16 @@ type SocketType = {
 
 const CATALOGUE_PDF = path.join(process.cwd(), "public", "AgriBird Brochure.pdf");
 
-/** Directory for Baileys `useMultiFileAuthState`. Returns `null` when the host cannot persist auth (e.g. Vercel). */
-function getWaAuthDir(): string | null {
+/** Directory for Baileys `useMultiFileAuthState` for a specific tenant. Returns `null` when the host cannot persist auth (e.g. Vercel). */
+function getWaAuthDir(userIdHex: string): string | null {
   const disabled = process.env.WA_DISABLE_QR === "1" || process.env.WA_DISABLE_QR === "true";
   if (disabled) return null;
   const override = process.env.WA_AUTH_DIR?.trim();
-  if (override) return path.resolve(override);
   if (process.env.VERCEL === "1") return null;
   if (process.env.AWS_LAMBDA_FUNCTION_NAME) return null;
   if (process.env.NETLIFY === "true") return null;
-  return path.join(process.cwd(), ".wa-auth", "default");
+  if (override) return path.join(path.resolve(override), userIdHex);
+  return path.join(process.cwd(), ".wa-auth", userIdHex);
 }
 
 const QR_UNSUPPORTED_HOST_ERROR =
@@ -75,35 +79,47 @@ interface QrConnectorStore {
   connectedAt: number | null;
 }
 
-const GLOBAL_KEY = "__satyam_wa_qr_connector__";
+const STORES_MAP_KEY = "__satyam_wa_qr_connector_map_v2__";
 
-function getStore(): QrConnectorStore {
-  const g = globalThis as Record<string, unknown>;
-  if (!g[GLOBAL_KEY]) {
-    g[GLOBAL_KEY] = {
-      socket: null,
-      booting: null,
-      autoReplyTimer: null,
-      reconnectTimer: null,
-      reconnectAttempts: 0,
-      processedInboundIds: new Set<string>(),
-      inflightInboundIds: new Set<string>(),
-      recentReplyByPhone: new Map<string, number>(),
-      connectedAt: null,
-      status: {
-        state: "idle",
-        qrDataUrl: null,
-        connectedPhone: null,
-        error: null,
-        updatedAt: new Date().toISOString(),
-      },
-    } satisfies QrConnectorStore;
-  }
-  return g[GLOBAL_KEY] as QrConnectorStore;
+function makeEmptyQrStore(): QrConnectorStore {
+  return {
+    socket: null,
+    booting: null,
+    autoReplyTimer: null,
+    reconnectTimer: null,
+    reconnectAttempts: 0,
+    processedInboundIds: new Set<string>(),
+    inflightInboundIds: new Set<string>(),
+    recentReplyByPhone: new Map<string, number>(),
+    connectedAt: null,
+    status: {
+      state: "idle",
+      qrDataUrl: null,
+      connectedPhone: null,
+      error: null,
+      updatedAt: new Date().toISOString(),
+    },
+  };
 }
 
-function setStatus(partial: Partial<QrSnapshot>) {
-  const store = getStore();
+function getStoreMap(): Map<string, QrConnectorStore> {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[STORES_MAP_KEY]) {
+    g[STORES_MAP_KEY] = new Map<string, QrConnectorStore>();
+  }
+  return g[STORES_MAP_KEY] as Map<string, QrConnectorStore>;
+}
+
+function getStore(userIdHex: string): QrConnectorStore {
+  const map = getStoreMap();
+  if (!map.has(userIdHex)) {
+    map.set(userIdHex, makeEmptyQrStore());
+  }
+  return map.get(userIdHex)!;
+}
+
+function setStatus(userIdHex: string, partial: Partial<QrSnapshot>) {
+  const store = getStore(userIdHex);
   store.status = {
     ...store.status,
     ...partial,
@@ -143,6 +159,8 @@ function isImageMessage(message: unknown): boolean {
 }
 
 async function processBusinessCardImage(args: {
+  userId: ObjectId;
+  userIdHex: string;
   msg: unknown;
   from: string;
   jid: string;
@@ -178,14 +196,15 @@ async function processBusinessCardImage(args: {
       return;
     }
 
-    await saveBusinessCardToExcel(data, normalizePhone(args.from));
+    await saveBusinessCardToExcel(data, normalizePhone(args.from), args.userIdHex);
 
     const name = data.name ? ` for ${data.name}` : "";
     const confirmText =
       `Got your business card${name}! 👍 I've saved the details.`;
-    await sendQrTextMessage(args.jid, confirmText);
+    await sendQrTextMessage(args.userIdHex, args.jid, confirmText);
 
     await persistIncomingOrOutgoingMessage({
+      userId: args.userId,
       waMessageId: `bc-confirm-${Date.now()}`,
       from: args.from,
       senderName: "SATYAM AI",
@@ -198,7 +217,27 @@ async function processBusinessCardImage(args: {
   }
 }
 
+async function applyQrLeadScoreUpdate(
+  leadsCol: ReturnType<typeof leadsCollection>,
+  lead: { _id?: ObjectId } | null,
+  _context: { text: string; direction: string; timestamp?: string }[],
+  analysis: AnalyzeResult,
+  shouldEscalate: boolean
+) {
+  if (!lead?._id) return;
+  const $set: Record<string, unknown> = {
+    preferredLanguage: analysis.language,
+    updatedAt: new Date(),
+  };
+  if (shouldEscalate) {
+    $set.needsHuman = true;
+    $set.conversationStatus = "escalated";
+  }
+  await leadsCol.updateOne({ _id: lead._id }, { $set }).catch(() => {});
+}
+
 async function persistIncomingOrOutgoingMessage(args: {
+  userId: ObjectId;
   waMessageId: string;
   from: string;
   remoteJid?: string;
@@ -212,10 +251,12 @@ async function persistIncomingOrOutgoingMessage(args: {
   const leadsCol = leadsCollection(db);
   const now = args.timestamp ?? new Date();
   const normalizedPhone = normalizePhone(args.from);
+  const uid = args.userId;
 
   if (args.direction === "out") {
     const duplicateWindowStart = new Date(now.getTime() - 20_000);
     const recentDuplicate = await messagesCol.findOne({
+      userId: uid,
       from: args.from,
       direction: "out",
       text: args.text,
@@ -228,9 +269,10 @@ async function persistIncomingOrOutgoingMessage(args: {
 
   await messagesCol
     .updateOne(
-      { waMessageId: args.waMessageId },
+      { userId: uid, waMessageId: args.waMessageId },
       {
         $setOnInsert: {
+          userId: uid,
           waMessageId: args.waMessageId,
           from: args.from,
           remoteJid: args.remoteJid,
@@ -245,16 +287,19 @@ async function persistIncomingOrOutgoingMessage(args: {
     )
     .catch(() => {});
 
-  const lead = await leadsCol.findOne({ phone: normalizedPhone });
+  const initialInterest = args.direction === "in" ? 35 : 10;
+
+  const lead = await leadsCol.findOne({ userId: uid, phone: normalizedPhone });
   if (!lead) {
     await leadsCol.insertOne({
+      userId: uid,
       name: args.senderName ?? normalizedPhone,
       phone: normalizedPhone,
       source: "WhatsApp",
       status: "New",
       conversationStatus: args.direction === "in" ? "awaiting_team_reply" : "new_inquiry",
       lastMessage: args.text,
-      interestScore: 50,
+      interestScore: initialInterest,
       assignedTo: "Unassigned",
       lastFollowup: "Just now",
       lastInboundAt: args.direction === "in" ? now : undefined,
@@ -262,6 +307,12 @@ async function persistIncomingOrOutgoingMessage(args: {
       createdAt: now,
       updatedAt: now,
     });
+    const insertedLead = await leadsCol.findOne({ userId: uid, phone: normalizedPhone });
+    if (insertedLead) {
+      const st = await getOrCreateSettings(db, uid);
+      await syncAutoFollowupQueueFromLead(db, uid, insertedLead, st).catch(() => {});
+    }
+    await refreshLeadInterestScoreFromWaThread(db, uid, args.from, normalizedPhone).catch(() => {});
     return;
   }
 
@@ -281,6 +332,12 @@ async function persistIncomingOrOutgoingMessage(args: {
       },
     }
   );
+  const leadFresh = await leadsCol.findOne({ userId: uid, phone: normalizedPhone });
+  if (leadFresh) {
+    const st = await getOrCreateSettings(db, uid);
+    await syncAutoFollowupQueueFromLead(db, uid, leadFresh, st).catch(() => {});
+  }
+  await refreshLeadInterestScoreFromWaThread(db, uid, args.from, normalizedPhone).catch(() => {});
 }
 
 function extractPhoneFromJid(jid?: string | null): string | null {
@@ -314,12 +371,15 @@ function isRecentInbound(ts?: Date): boolean {
   return ageMs >= 0 && ageMs <= 5 * 60 * 1000;
 }
 
-async function persistBaileysMessage(msg: {
-  key?: { id?: string; remoteJid?: string; fromMe?: boolean };
-  message?: unknown;
-  pushName?: string;
-  messageTimestamp?: unknown;
-}) {
+async function persistBaileysMessage(
+  userId: ObjectId,
+  msg: {
+    key?: { id?: string; remoteJid?: string; fromMe?: boolean };
+    message?: unknown;
+    pushName?: string;
+    messageTimestamp?: unknown;
+  }
+) {
   const phone = extractPhoneFromJid(msg.key?.remoteJid);
   if (!phone) return;
 
@@ -331,6 +391,7 @@ async function persistBaileysMessage(msg: {
   const timestamp = parseMessageTimestamp(msg.messageTimestamp);
 
   await persistIncomingOrOutgoingMessage({
+    userId,
     waMessageId,
     from: phone,
     remoteJid: msg.key?.remoteJid,
@@ -342,13 +403,16 @@ async function persistBaileysMessage(msg: {
 }
 
 async function processQrInboundAutoReply(args: {
+  userId: ObjectId;
+  userIdHex: string;
   inboundMessageId?: string;
   jid: string;
   from: string;
   senderName: string;
   text: string;
 }) {
-  const store = getStore();
+  const store = getStore(args.userIdHex);
+  const uid = args.userId;
   const inboundId = args.inboundMessageId ?? `${args.from}:${normalizeTextForKey(args.text)}`;
   if (store.processedInboundIds.has(inboundId) || store.inflightInboundIds.has(inboundId)) {
     return;
@@ -362,7 +426,7 @@ async function processQrInboundAutoReply(args: {
   store.inflightInboundIds.add(inboundId);
   try {
     const db = await getDb();
-    const settings = await getOrCreateSettings(db);
+    const settings = await getOrCreateSettings(db, uid);
     if (!settings.autoReply) {
       store.processedInboundIds.add(inboundId);
       return;
@@ -374,7 +438,7 @@ async function processQrInboundAutoReply(args: {
     await sleep(1800);
     if (args.inboundMessageId) {
       const latestInbound = await messagesCol
-        .find({ from: args.from, direction: "in" })
+        .find({ userId: uid, from: args.from, direction: "in" })
         .sort({ timestamp: -1 })
         .limit(1)
         .toArray();
@@ -384,6 +448,7 @@ async function processQrInboundAutoReply(args: {
       }
       if (latestInbound[0]) {
         const alreadyReplied = await messagesCol.findOne({
+          userId: uid,
           from: args.from,
           direction: "out",
           timestamp: { $gte: latestInbound[0].timestamp },
@@ -395,7 +460,7 @@ async function processQrInboundAutoReply(args: {
       }
     }
     const normalizedPhone = normalizePhone(args.from);
-    const lead = await leadsCol.findOne({ phone: normalizedPhone });
+    const lead = await leadsCol.findOne({ userId: uid, phone: normalizedPhone });
     if (lead?.needsHuman) {
       await leadsCol.updateOne(
         { _id: lead._id },
@@ -412,7 +477,7 @@ async function processQrInboundAutoReply(args: {
     }
 
     const recent = await messagesCol
-      .find({ from: args.from })
+      .find({ userId: uid, from: args.from })
       .sort({ timestamp: -1 })
       .limit(20)
       .toArray();
@@ -424,24 +489,18 @@ async function processQrInboundAutoReply(args: {
     const shouldEscalate = shouldEscalateConversation({
       latestText: args.text,
       keywords: settings.humanHandoverKeywords,
-      analysisNeedsHuman: analysis.needsHuman,
-      sentiment: analysis.sentiment,
     });
 
-    if (shouldEscalate) {
-      if (lead) {
-        await leadsCol.updateOne(
-          { _id: lead._id },
-          {
-            $set: {
-              needsHuman: true,
-              conversationStatus: "escalated",
-              preferredLanguage: analysis.language,
-              updatedAt: new Date(),
-            },
-          }
-        );
+    await applyQrLeadScoreUpdate(leadsCol, lead, context, analysis, shouldEscalate);
+
+    if (lead?._id) {
+      const freshLead = await leadsCol.findOne({ _id: lead._id });
+      if (freshLead) {
+        await syncAutoFollowupQueueFromLead(db, uid, freshLead, settings).catch(() => {});
       }
+    }
+
+    if (shouldEscalate) {
       store.processedInboundIds.add(inboundId);
       return;
     }
@@ -466,13 +525,14 @@ async function processQrInboundAutoReply(args: {
       });
     }
 
-    const sent = await sendQrTextMessage(args.jid, safeReplyText);
+    const sent = await sendQrTextMessage(args.userIdHex, args.jid, safeReplyText);
     if (!sent.ok) {
       console.error("[wa-qr] auto-reply send failed:", sent.error);
       return;
     }
 
     await persistIncomingOrOutgoingMessage({
+      userId: uid,
       waMessageId: sent.messageId,
       from: args.from,
       senderName: "SATYAM AI",
@@ -485,14 +545,16 @@ async function processQrInboundAutoReply(args: {
     // but only if we haven't already sent it to this contact before.
     if (reply.sharedCatalogue && settings.autoShareCatalogue) {
       const alreadySentPdf = await messagesCol.findOne({
+        userId: uid,
         from: args.from,
         direction: "out",
         text: "[AgriBird Catalogue PDF]",
       });
       if (!alreadySentPdf) {
-        const catResult = await sendQrCatalogue(args.jid);
+        const catResult = await sendQrCatalogue(args.userIdHex, args.jid);
         if (catResult.ok) {
           await persistIncomingOrOutgoingMessage({
+            userId: uid,
             waMessageId: catResult.messageId,
             from: args.from,
             senderName: "SATYAM AI",
@@ -513,17 +575,17 @@ async function processQrInboundAutoReply(args: {
   }
 }
 
-async function runQrAutoReplySweep(limit = 10) {
-  const store = getStore();
+async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 10) {
+  const store = getStore(userIdHex);
   if (!store.socket || store.status.state !== "connected") return;
 
   const db = await getDb();
-  const settings = await getOrCreateSettings(db);
+  const settings = await getOrCreateSettings(db, userId);
   const messagesCol = waMessagesCollection(db);
   const leadsCol = leadsCollection(db);
 
   const inbound = await messagesCol
-    .find({ direction: "in", phoneNumberId: "qr-linked" })
+    .find({ userId, direction: "in", phoneNumberId: "qr-linked" })
     .sort({ timestamp: -1 })
     .limit(limit)
     .toArray();
@@ -540,6 +602,7 @@ async function runQrAutoReplySweep(limit = 10) {
       }
 
       const hasOutbound = await messagesCol.findOne({
+        userId,
         from: msg.from,
         direction: "out",
         _id: { $gt: msg._id },
@@ -550,6 +613,7 @@ async function runQrAutoReplySweep(limit = 10) {
       }
 
       const newerInbound = await messagesCol.findOne({
+        userId,
         from: msg.from,
         direction: "in",
         timestamp: { $gt: msg.timestamp },
@@ -566,7 +630,7 @@ async function runQrAutoReplySweep(limit = 10) {
       }
 
       const normalized = normalizePhone(msg.from);
-      const lead = await leadsCol.findOne({ phone: normalized });
+      const lead = await leadsCol.findOne({ userId, phone: normalized });
       if (lead?.needsHuman) {
         await leadsCol.updateOne(
           { _id: lead._id },
@@ -583,7 +647,7 @@ async function runQrAutoReplySweep(limit = 10) {
       }
 
       const recent = await messagesCol
-        .find({ from: msg.from })
+        .find({ userId, from: msg.from })
         .sort({ timestamp: -1 })
         .limit(20)
         .toArray();
@@ -594,17 +658,18 @@ async function runQrAutoReplySweep(limit = 10) {
       const shouldEscalate = shouldEscalateConversation({
         latestText: msg.text,
         keywords: settings.humanHandoverKeywords,
-        analysisNeedsHuman: analysis.needsHuman,
-        sentiment: analysis.sentiment,
       });
 
-      if (shouldEscalate) {
-        if (lead) {
-          await leadsCol.updateOne(
-            { _id: lead._id },
-            { $set: { needsHuman: true, conversationStatus: "escalated", updatedAt: new Date() } }
-          );
+      await applyQrLeadScoreUpdate(leadsCol, lead, context, analysis, shouldEscalate);
+
+      if (lead?._id) {
+        const freshLeadSweep = await leadsCol.findOne({ _id: lead._id });
+        if (freshLeadSweep) {
+          await syncAutoFollowupQueueFromLead(db, userId, freshLeadSweep, settings).catch(() => {});
         }
+      }
+
+      if (shouldEscalate) {
         store.processedInboundIds.add(inboundId);
         continue;
       }
@@ -628,13 +693,14 @@ async function runQrAutoReplySweep(limit = 10) {
           replaced: safeReplyText,
         });
       }
-      const sent = await sendQrTextMessage(msg.from, safeReplyText);
+      const sent = await sendQrTextMessage(userIdHex, msg.from, safeReplyText);
       if (!sent.ok) {
         console.error("[wa-qr] sweep send failed:", sent.error);
         continue;
       }
 
       await persistIncomingOrOutgoingMessage({
+        userId,
         waMessageId: sent.messageId,
         from: msg.from,
         senderName: "SATYAM AI",
@@ -647,14 +713,16 @@ async function runQrAutoReplySweep(limit = 10) {
       // but only if it hasn't already been sent to this contact before.
       if (reply.sharedCatalogue && settings.autoShareCatalogue) {
         const alreadySentPdf = await messagesCol.findOne({
+          userId,
           from: msg.from,
           direction: "out",
           text: "[AgriBird Catalogue PDF]",
         });
         if (!alreadySentPdf) {
-          const catResult = await sendQrCatalogue(msg.from);
+          const catResult = await sendQrCatalogue(userIdHex, msg.from);
           if (catResult.ok) {
             await persistIncomingOrOutgoingMessage({
+              userId,
               waMessageId: catResult.messageId,
               from: msg.from,
               senderName: "SATYAM AI",
@@ -677,8 +745,8 @@ async function runQrAutoReplySweep(limit = 10) {
 }
 
 
-async function stopSocket(clearAuth = false) {
-  const store = getStore();
+async function stopSocket(userIdHex: string, clearAuth = false) {
+  const store = getStore(userIdHex);
   if (store.autoReplyTimer) {
     clearInterval(store.autoReplyTimer);
     store.autoReplyTimer = null;
@@ -702,18 +770,22 @@ async function stopSocket(clearAuth = false) {
   store.socket = null;
 
   if (clearAuth) {
-    const authDir = getWaAuthDir();
+    const authDir = getWaAuthDir(userIdHex);
     if (authDir) await rm(authDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-export async function startQrConnection(forceRestart = false): Promise<QrSnapshot> {
-  const store = getStore();
+export async function startQrConnection(userIdHex: string, forceRestart = false): Promise<QrSnapshot> {
+  if (!ObjectId.isValid(userIdHex)) {
+    throw new Error("Invalid user id for QR session");
+  }
+  const userId = new ObjectId(userIdHex);
+  const store = getStore(userIdHex);
 
   if (forceRestart) {
-    await stopSocket(true);
+    await stopSocket(userIdHex, true);
     store.booting = null;
-    setStatus({
+    setStatus(userIdHex, {
       state: "idle",
       connectedPhone: null,
       qrDataUrl: null,
@@ -729,9 +801,9 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
     return store.booting;
   }
 
-  const authDir = getWaAuthDir();
+  const authDir = getWaAuthDir(userIdHex);
   if (!authDir) {
-    setStatus({
+    setStatus(userIdHex, {
       state: "error",
       qrDataUrl: null,
       error: QR_UNSUPPORTED_HOST_ERROR,
@@ -741,7 +813,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
 
   store.booting = (async () => {
     try {
-      setStatus({ state: "connecting", qrDataUrl: null, error: null });
+      setStatus(userIdHex, { state: "connecting", qrDataUrl: null, error: null });
 
       // Force ws pure JS path; avoids native bufferutil mismatch under Next bundling.
       process.env.WS_NO_BUFFER_UTIL = "1";
@@ -792,7 +864,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           console.error("[wa-qr] saveCreds failed:", err);
           const code =
             err instanceof Error && "code" in err ? (err as NodeJS.ErrnoException).code : undefined;
-          setStatus({
+          setStatus(userIdHex, {
             state: "error",
             qrDataUrl: null,
             error:
@@ -806,7 +878,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
       });
 
       sock.ev.on("messages.upsert", ({ messages }) => {
-        const store = getStore();
+        const store = getStore(userIdHex);
         for (const msg of messages ?? []) {
           const ts = parseMessageTimestamp(msg.messageTimestamp);
 
@@ -818,7 +890,10 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
 
           // Skip outbound messages entirely for routing logic
           if (msg.key?.fromMe) {
-            persistBaileysMessage(msg as unknown as Parameters<typeof persistBaileysMessage>[0]).catch((err) => {
+            persistBaileysMessage(
+              userId,
+              msg as unknown as Parameters<typeof persistBaileysMessage>[1]
+            ).catch((err) => {
               console.error("[wa-qr] persist outbound failed:", err);
             });
             continue;
@@ -831,6 +906,8 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           // ── Image: check if it's a business card ──────────────────────────
           if (isImageMessage(msg.message) && isRecentInbound(ts)) {
             processBusinessCardImage({
+              userId,
+              userIdHex,
               msg,
               from,
               jid,
@@ -842,7 +919,10 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           }
 
           // ── Text: normal persist + auto-reply ────────────────────────────
-          persistBaileysMessage(msg as unknown as Parameters<typeof persistBaileysMessage>[0]).catch((err) => {
+          persistBaileysMessage(
+            userId,
+            msg as unknown as Parameters<typeof persistBaileysMessage>[1]
+          ).catch((err) => {
             console.error("[wa-qr] persist message failed:", err);
           });
 
@@ -852,6 +932,8 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
 
           const inboundMessageId = msg.key?.id ?? undefined;
           processQrInboundAutoReply({
+            userId,
+            userIdHex,
             inboundMessageId,
             jid,
             from,
@@ -869,7 +951,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
       sock.ev.on("connection.update", async (update) => {
         if (update.qr) {
           const qrDataUrl = await toQrDataUrl(update.qr);
-          setStatus({ state: "qr_ready", qrDataUrl, error: null });
+          setStatus(userIdHex, { state: "qr_ready", qrDataUrl, error: null });
         }
 
         if (update.connection === "open") {
@@ -880,7 +962,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
             clearTimeout(store.reconnectTimer);
             store.reconnectTimer = null;
           }
-          setStatus({
+          setStatus(userIdHex, {
             state: "connected",
             connectedPhone: phone,
             qrDataUrl: null,
@@ -888,11 +970,11 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           });
           if (store.autoReplyTimer) clearInterval(store.autoReplyTimer);
           store.autoReplyTimer = setInterval(() => {
-            runQrAutoReplySweep(20).catch((err) => {
+            runQrAutoReplySweep(userIdHex, userId, 20).catch((err) => {
               console.error("[wa-qr] auto-reply sweep failed:", err);
             });
           }, 8000);
-          runQrAutoReplySweep(20).catch(() => {});
+          runQrAutoReplySweep(userIdHex, userId, 20).catch(() => {});
         }
 
         if (update.connection === "close") {
@@ -915,7 +997,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
 
           if (isReplaced) {
             store.reconnectAttempts = 0;
-            setStatus({
+            setStatus(userIdHex, {
               state: "idle",
               connectedPhone: null,
               qrDataUrl: null,
@@ -928,7 +1010,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
 
           if (!shouldReconnect) {
             store.reconnectAttempts = 0;
-            setStatus({
+            setStatus(userIdHex, {
               state: "idle",
               connectedPhone: null,
               qrDataUrl: null,
@@ -940,7 +1022,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           const MAX_ATTEMPTS = 5;
           if (store.reconnectAttempts >= MAX_ATTEMPTS) {
             store.reconnectAttempts = 0;
-            setStatus({
+            setStatus(userIdHex, {
               state: "error",
               qrDataUrl: null,
               error: `Reconnection failed after ${MAX_ATTEMPTS} attempts. Click Connect again.`,
@@ -952,7 +1034,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           const delay = Math.min(3000 * Math.pow(2, store.reconnectAttempts), 30000);
           store.reconnectAttempts += 1;
 
-          setStatus({
+          setStatus(userIdHex, {
             state: "connecting",
             qrDataUrl: null,
             error: `Connection dropped. Reconnecting in ${Math.round(delay / 1000)}s (attempt ${store.reconnectAttempts}/${MAX_ATTEMPTS})…`,
@@ -961,7 +1043,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
           store.reconnectTimer = setTimeout(() => {
             store.reconnectTimer = null;
             store.booting = null;
-            startQrConnection().catch((err) => {
+            startQrConnection(userIdHex).catch((err) => {
               console.error("[wa-qr] scheduled reconnect failed:", err);
             });
           }, delay);
@@ -970,7 +1052,7 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
 
       return store.status;
     } catch (err) {
-      setStatus({
+      setStatus(userIdHex, {
         state: "error",
         qrDataUrl: null,
         error: err instanceof Error ? err.message : String(err),
@@ -984,19 +1066,20 @@ export async function startQrConnection(forceRestart = false): Promise<QrSnapsho
   return store.booting;
 }
 
-export function getQrSnapshot(): QrSnapshot {
-  return getStore().status;
+export function getQrSnapshot(userIdHex: string): QrSnapshot {
+  return getStore(userIdHex).status;
 }
 
-export async function stopQrConnection(): Promise<void> {
-  await stopSocket(true);
-  setStatus({ state: "idle", qrDataUrl: null, connectedPhone: null, error: null });
+export async function stopQrConnection(userIdHex: string): Promise<void> {
+  await stopSocket(userIdHex, true);
+  setStatus(userIdHex, { state: "idle", qrDataUrl: null, connectedPhone: null, error: null });
 }
 
 export async function sendQrCatalogue(
+  userIdHex: string,
   to: string
 ): Promise<{ ok: true; messageId: string } | { ok: false; error: string }> {
-  const store = getStore();
+  const store = getStore(userIdHex);
   if (!store.socket || store.status.state !== "connected") {
     return { ok: false, error: "QR session is not connected" };
   }
@@ -1026,8 +1109,8 @@ export async function sendQrCatalogue(
   }
 }
 
-export async function sendQrTextMessage(to: string, text: string) {
-  const store = getStore();
+export async function sendQrTextMessage(userIdHex: string, to: string, text: string) {
+  const store = getStore(userIdHex);
   if (!store.socket || store.status.state !== "connected") {
     return { ok: false as const, error: "QR session is not connected" };
   }
@@ -1056,6 +1139,51 @@ export async function sendQrTextMessage(to: string, text: string) {
     ok: false as const,
     error: lastError,
   };
+}
+
+const WA_CAPTION_MAX = 1024;
+
+export async function sendQrImageMessage(
+  userIdHex: string,
+  to: string,
+  image: Buffer,
+  caption?: string
+): Promise<{ ok: true; messageId: string } | { ok: false; error: string }> {
+  const store = getStore(userIdHex);
+  if (!store.socket || store.status.state !== "connected") {
+    return { ok: false, error: "QR session is not connected" };
+  }
+
+  const jids = resolveSendJids(to);
+  if (jids.length === 0) {
+    return { ok: false, error: "Invalid recipient JID/number" };
+  }
+
+  const cap =
+    caption && caption.length > WA_CAPTION_MAX
+      ? `${caption.slice(0, WA_CAPTION_MAX - 1)}…`
+      : caption?.trim()
+        ? caption
+        : undefined;
+
+  let lastError = "Failed to send image via QR";
+  for (const jid of jids) {
+    try {
+      console.log("[wa-qr] send image", { jid, bytes: image.length });
+      const res = await store.socket.sendMessage(
+        jid,
+        cap ? { image, caption: cap } : { image }
+      );
+      return {
+        ok: true,
+        messageId: res.key?.id ?? `qr-img-${Date.now()}`,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  return { ok: false, error: lastError };
 }
 
 function resolveSendJids(to: string): string[] {

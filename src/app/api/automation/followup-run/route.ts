@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import type { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
@@ -12,6 +13,11 @@ import {
   type WhatsAppRuntimeConfig,
 } from "@/lib/whatsapp";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
+import { requireApiUser } from "@/lib/auth/session";
+import {
+  clearAutoFollowupQueueTask,
+  syncAutoFollowupQueueFromLead,
+} from "@/lib/auto-followup-queue";
 
 interface RunOptions {
   dryRun: boolean;
@@ -20,10 +26,12 @@ interface RunOptions {
 
 export async function POST(req: NextRequest) {
   try {
+    const auth = await requireApiUser(req);
+    if (auth instanceof Response) return auth;
     const body = (await req.json().catch(() => ({}))) as Partial<RunOptions>;
     const dryRun = Boolean(body.dryRun);
     const limit = Math.min(Math.max(Number(body.limit) || 200, 1), 1000);
-    const result = await runFollowupAutomation({ dryRun, limit });
+    const result = await runFollowupAutomation({ dryRun, limit }, auth.userId);
     return NextResponse.json({ ok: true, ...result });
   } catch (err) {
     console.error("[POST /api/automation/followup-run]", err);
@@ -34,9 +42,11 @@ export async function POST(req: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    const result = await runFollowupAutomation({ dryRun: true, limit: 200 });
+    const auth = await requireApiUser(req);
+    if (auth instanceof Response) return auth;
+    const result = await runFollowupAutomation({ dryRun: true, limit: 200 }, auth.userId);
     return NextResponse.json({ ok: true, preview: true, ...result });
   } catch (err) {
     console.error("[GET /api/automation/followup-run]", err);
@@ -47,18 +57,19 @@ export async function GET() {
   }
 }
 
-async function runFollowupAutomation(options: RunOptions) {
+async function runFollowupAutomation(options: RunOptions, userId: ObjectId) {
+  const userIdHex = userId.toHexString();
   const db = await getDb();
   const leadsCol = leadsCollection(db);
   const messagesCol = waMessagesCollection(db);
   const followupsCol = followupsCollection(db);
-  const settings = await getOrCreateSettings(db);
+  const settings = await getOrCreateSettings(db, userId);
   const now = new Date();
   const waConfig: WhatsAppRuntimeConfig | undefined =
     resolveWhatsAppRuntimeConfig(settings);
 
   const leads = await leadsCol
-    .find({ source: "WhatsApp", status: { $ne: "Closed" } })
+    .find({ userId, source: "WhatsApp", status: { $ne: "Closed" } })
     .sort({ updatedAt: -1 })
     .limit(options.limit)
     .toArray();
@@ -78,12 +89,12 @@ async function runFollowupAutomation(options: RunOptions) {
 
     const variants = phoneVariants(lead.phone);
     const latestInbound = await messagesCol
-      .find({ from: { $in: variants }, direction: "in" })
+      .find({ userId, from: { $in: variants }, direction: "in" })
       .sort({ timestamp: -1 })
       .limit(1)
       .toArray();
     const latestOutbound = await messagesCol
-      .find({ from: { $in: variants }, direction: "out" })
+      .find({ userId, from: { $in: variants }, direction: "out" })
       .sort({ timestamp: -1 })
       .limit(1)
       .toArray();
@@ -119,10 +130,27 @@ async function runFollowupAutomation(options: RunOptions) {
       continue;
     }
 
+    const minScore =
+      typeof settings.followUpMinInterestScore === "number" ? settings.followUpMinInterestScore : 0;
+    if (minScore > 0 && (lead.interestScore ?? 0) < minScore) {
+      skipped += 1;
+      details.push({
+        leadId,
+        name: lead.name,
+        action: "skip",
+        reason: `Interest score ${lead.interestScore ?? 0} < minimum ${minScore}`,
+      });
+      continue;
+    }
+
     const alreadyToday = await followupsCol.findOne({
+      userId,
       leadId,
       createdAt: { $gte: startOfDay(now) },
-      task: /^Auto follow-up/i,
+      $or: [
+        { task: { $regex: /^Auto follow-up sent/i } },
+        { task: { $regex: /^Auto follow-up blocked/i } },
+      ],
     });
     if (alreadyToday) {
       skipped += 1;
@@ -145,6 +173,7 @@ async function runFollowupAutomation(options: RunOptions) {
           }
         );
         await followupsCol.insertOne({
+          userId,
           leadId,
           leadName: lead.name,
           phone: lead.phone,
@@ -156,6 +185,7 @@ async function runFollowupAutomation(options: RunOptions) {
           createdAt: now,
           updatedAt: now,
         });
+        await clearAutoFollowupQueueTask(db, userId, leadId);
       }
       details.push({ leadId, name: lead.name, action: "escalate", reason: "Sensitive topic detected" });
       continue;
@@ -185,13 +215,13 @@ async function runFollowupAutomation(options: RunOptions) {
     }
 
     const waTo = variants[0];
-    const qrConnected = getQrSnapshot().state === "connected";
+    const qrConnected = getQrSnapshot(userIdHex).state === "connected";
     const cloudConfigured = Boolean(waConfig?.token && waConfig?.phoneNumberId);
     let sendRes: Awaited<ReturnType<typeof sendTextMessage>>;
     let channel: "cloud" | "qr";
 
     if (qrConnected) {
-      const qrSend = await sendQrTextMessage(waTo, safeFollowUp);
+      const qrSend = await sendQrTextMessage(userIdHex, waTo, safeFollowUp);
       if (qrSend.ok) {
         sendRes = { ok: true, messageId: qrSend.messageId, mode: "live" };
         channel = "qr";
@@ -203,7 +233,7 @@ async function runFollowupAutomation(options: RunOptions) {
       sendRes = await sendTextMessage(waTo, safeFollowUp, waConfig);
       channel = "cloud";
       if ((sendRes.ok && sendRes.mode === "dry-run") || !sendRes.ok) {
-        const qrSend = await sendQrTextMessage(waTo, safeFollowUp);
+        const qrSend = await sendQrTextMessage(userIdHex, waTo, safeFollowUp);
         if (qrSend.ok) {
           sendRes = { ok: true, messageId: qrSend.messageId, mode: "live" };
           channel = "qr";
@@ -236,9 +266,10 @@ async function runFollowupAutomation(options: RunOptions) {
 
     sent += 1;
     await messagesCol.updateOne(
-      { waMessageId: sendRes.messageId },
+      { userId, waMessageId: sendRes.messageId },
       {
         $setOnInsert: {
+          userId,
           waMessageId: sendRes.messageId,
           from: waTo,
           senderName: "SATYAM AI",
@@ -266,6 +297,7 @@ async function runFollowupAutomation(options: RunOptions) {
     );
 
     await followupsCol.insertOne({
+      userId,
       leadId,
       leadName: lead.name,
       phone: lead.phone,
@@ -277,6 +309,12 @@ async function runFollowupAutomation(options: RunOptions) {
       createdAt: now,
       updatedAt: now,
     });
+    await clearAutoFollowupQueueTask(db, userId, leadId);
+
+    const leadFresh = await leadsCol.findOne({ _id: lead._id });
+    if (leadFresh) {
+      await syncAutoFollowupQueueFromLead(db, userId, leadFresh, settings);
+    }
 
     details.push({ leadId, name: lead.name, action: `sent:${channel}`, reason: follow.reason });
   }

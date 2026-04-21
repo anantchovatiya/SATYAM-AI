@@ -9,7 +9,7 @@
  *     project root, creating the file + sheet if they don't exist yet.
  */
 
-import { writeFile, readFile, access } from "node:fs/promises";
+import { writeFile, readFile, access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import * as XLSX from "xlsx";
 
@@ -27,7 +27,9 @@ export interface BusinessCardData {
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
-const EXCEL_PATH = path.join(process.cwd(), "business-cards.xlsx");
+function businessCardsExcelPath(userIdHex: string): string {
+  return path.join(process.cwd(), "data", "business-cards", `${userIdHex}.xlsx`);
+}
 
 // ── Gemini Vision helpers ────────────────────────────────────────────────────
 
@@ -314,8 +316,11 @@ export async function extractBusinessCardData(
 
 export async function saveBusinessCardToExcel(
   data: BusinessCardData,
-  senderPhone: string
+  senderPhone: string,
+  userIdHex: string
 ): Promise<void> {
+  const EXCEL_PATH = businessCardsExcelPath(userIdHex);
+  await mkdir(path.dirname(EXCEL_PATH), { recursive: true }).catch(() => {});
   const row: Record<string, string> = {
     Name: data.name || "",
     "Job Title": data.jobTitle || "",
@@ -370,7 +375,8 @@ export async function saveBusinessCardToExcel(
 }
 
 /** Number of data rows in the Business Cards sheet (0 if file or sheet missing). */
-export async function getBusinessCardCount(): Promise<number> {
+export async function getBusinessCardCount(userIdHex: string): Promise<number> {
+  const EXCEL_PATH = businessCardsExcelPath(userIdHex);
   try {
     await access(EXCEL_PATH);
     const fileBuffer = await readFile(EXCEL_PATH);

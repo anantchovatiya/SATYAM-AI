@@ -2,7 +2,7 @@
  * Canonical WhatsApp identity for matching leads ↔ messages (Cloud API + QR).
  */
 
-import type { Collection } from "mongodb";
+import type { Collection, ObjectId } from "mongodb";
 import type { LeadDoc } from "@/lib/models/lead";
 
 export function escapeRegex(s: string): string {
@@ -35,6 +35,7 @@ export function formatLeadPhoneFromRaw(raw: string): string {
 
 export async function findLeadByCanonicalPhone(
   col: Collection<LeadDoc>,
+  userId: ObjectId,
   rawPhone: string
 ): Promise<LeadDoc | null> {
   const c = canonicalWaContactKey(rawPhone);
@@ -46,7 +47,15 @@ export async function findLeadByCanonicalPhone(
     variants.add(`+91${c.slice(2)}`);
     variants.add(c.slice(2));
   }
-  return col.findOne({ phone: { $in: [...variants] } });
+  return col.findOne({ userId, phone: { $in: [...variants] } });
+}
+
+/** Match stored `from` variants for a tenant. */
+export function mongoMatchStoredWaFromForUser(
+  userId: ObjectId,
+  canonicalDigits: string
+): Record<string, unknown> {
+  return { userId, ...mongoMatchStoredWaFrom(canonicalDigits) };
 }
 
 export function mongoMatchStoredWaFrom(canonicalDigits: string): { $or: Record<string, unknown>[] } {

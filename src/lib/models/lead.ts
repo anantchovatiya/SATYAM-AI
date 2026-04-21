@@ -4,6 +4,7 @@ export type LeadStatus = "New" | "Hot" | "Silent" | "Closed";
 
 export interface LeadDoc {
   _id?: ObjectId;
+  userId?: ObjectId;
   name: string;
   phone: string;
   source: string;
@@ -37,6 +38,6 @@ export function leadsCollection(db: Db): Collection<LeadDoc> {
 }
 
 export function docToRow(doc: LeadDoc): LeadRow {
-  const { _id, ...rest } = doc;
+  const { _id, userId: _uid, ...rest } = doc;
   return { id: _id!.toHexString(), ...rest };
 }

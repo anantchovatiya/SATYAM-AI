@@ -25,10 +25,12 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { ObjectId } from "mongodb";
 import { generateFollowUp } from "@/lib/ai";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
 import { getOrCreateSettings } from "@/lib/models/settings";
+import { requireApiUser } from "@/lib/auth/session";
 
 // ── POST ───────────────────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
@@ -77,6 +79,10 @@ export async function POST(req: NextRequest) {
 // GET /api/followup?leadId=<mongo_id>
 // Loads lead + workspace settings from MongoDB, then generates the follow-up.
 export async function GET(req: NextRequest) {
+  const auth = await requireApiUser(req);
+  if (auth instanceof Response) return auth;
+  const { userId } = auth;
+
   const leadId = new URL(req.url).searchParams.get("leadId");
 
   if (!leadId) {
@@ -90,10 +96,9 @@ export async function GET(req: NextRequest) {
     const db = await getDb();
     const col = leadsCollection(db);
 
-    const { ObjectId } = await import("mongodb");
     let lead;
     try {
-      lead = await col.findOne({ _id: new ObjectId(leadId) });
+      lead = await col.findOne({ _id: new ObjectId(leadId), userId });
     } catch {
       return NextResponse.json({ error: "Invalid leadId format" }, { status: 400 });
     }
@@ -102,7 +107,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Lead not found" }, { status: 404 });
     }
 
-    const settings = await getOrCreateSettings(db);
+    const settings = await getOrCreateSettings(db, userId);
 
     // Calculate days since last followup — crude but serviceable for demo
     const daysSince = parseDaysAgo(lead.lastFollowup);

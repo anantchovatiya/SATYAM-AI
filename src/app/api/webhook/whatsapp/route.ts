@@ -8,8 +8,8 @@
  *   2. Deduplicate (idempotent on waMessageId)
  *   3. Upsert lead by phone number → MongoDB leads collection
  *   4. Save raw message → whatsapp_messages collection
- *   5. Run AI analysis (language, sentiment, leadScore, stage, needsHuman)
- *   6. Update lead status + score in MongoDB
+ *   5. Run AI analysis (dual-window prompt: leadScore from last 5 messages via Gemini when configured)
+ *   6. Update lead status + score in MongoDB; after outbound replies, refresh score from Gemini on last 5
  *   7a. needsHuman  → flag lead, log HANDOVER event, stop
  *   7b. autoReply off → log SKIPPED event, stop
  *   7c. autoReply on  → generate reply → send via WhatsApp Graph API
@@ -20,9 +20,16 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { ObjectId, type Db } from "mongodb";
 import { getDb }               from "@/lib/mongodb";
 import { leadsCollection }     from "@/lib/models/lead";
-import { getOrCreateSettings } from "@/lib/models/settings";
+import {
+  getOrCreateSettings,
+  findSettingsByPhoneNumberId,
+  findSettingsByVerifyToken,
+} from "@/lib/models/settings";
+import { usersCollection } from "@/lib/models/user";
+import { ensureTenantIndexes } from "@/lib/models/tenant-indexes";
 import {
   webhookLogsCollection,
   waMessagesCollection,
@@ -39,13 +46,17 @@ import {
   type WhatsAppRuntimeConfig,
 } from "@/lib/whatsapp";
 import { analyzeChat, generateReply } from "@/lib/ai";
+import { clampAiInterestScore0to100 } from "@/lib/interest-score";
+import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
+import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
 import {
   findLeadByCanonicalPhone,
   formatLeadPhoneFromRaw,
-  mongoMatchStoredWaFrom,
+  canonicalWaContactKey,
+  mongoMatchStoredWaFromForUser,
 } from "@/lib/wa-phone";
 
 // ── GET — Meta webhook verification ──────────────────────────────────────────
@@ -56,20 +67,23 @@ export async function GET(req: NextRequest) {
   const token     = searchParams.get("hub.verify_token");
   const challenge = searchParams.get("hub.challenge");
 
-  let verifyToken = process.env.WHATSAPP_VERIFY_TOKEN ?? "satyam_ai_verify";
   try {
     const db = await getDb();
-    const settings = await getOrCreateSettings(db);
-    if (settings.whatsapp?.verifyToken) {
-      verifyToken = settings.whatsapp.verifyToken;
+    const matched = token ? await findSettingsByVerifyToken(db, token) : null;
+    const envFallback = process.env.WHATSAPP_VERIFY_TOKEN ?? "satyam_ai_verify";
+    const okToken =
+      Boolean(token) &&
+      (Boolean(matched?.whatsapp?.verifyToken && matched.whatsapp.verifyToken === token) ||
+        token === envFallback);
+    if (mode === "subscribe" && okToken && challenge) {
+      console.log("[WhatsApp Webhook] Verification successful");
+      return new NextResponse(challenge, { status: 200 });
     }
   } catch {
-    // Fall back to env token when DB read fails.
-  }
-
-  if (mode === "subscribe" && token === verifyToken && challenge) {
-    console.log("[WhatsApp Webhook] Verification successful");
-    return new NextResponse(challenge, { status: 200 });
+    const envFallback = process.env.WHATSAPP_VERIFY_TOKEN ?? "satyam_ai_verify";
+    if (mode === "subscribe" && token === envFallback && challenge) {
+      return new NextResponse(challenge, { status: 200 });
+    }
   }
 
   console.warn("[WhatsApp Webhook] Verification failed", { mode, token });
@@ -91,6 +105,19 @@ function countWebhookIncomingMessages(body: unknown): number {
   } catch {
     return 0;
   }
+}
+
+async function resolveOwnerUserIdForInbound(db: Db, msg: ParsedWaMessage): Promise<ObjectId | null> {
+  const doc = await findSettingsByPhoneNumberId(db, msg.phoneNumberId);
+  if (doc?.userId) return doc.userId;
+  if (
+    process.env.WHATSAPP_PHONE_NUMBER_ID &&
+    process.env.WHATSAPP_PHONE_NUMBER_ID === msg.phoneNumberId
+  ) {
+    const u = await usersCollection(db).findOne({});
+    return u?._id ?? null;
+  }
+  return null;
 }
 
 // ── POST — incoming message pipeline ──────────────────────────────────────────
@@ -123,6 +150,7 @@ export async function POST(req: NextRequest) {
 
   const db = await getDb();
   await ensureIndexes(db).catch(() => {}); // best-effort index creation
+  await ensureTenantIndexes(db).catch(() => {});
 
   const results = await Promise.allSettled(
     messages.map((msg) => processMessage(msg, db))
@@ -148,13 +176,20 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   const messagesCol = waMessagesCollection(db);
   const leadsCol    = leadsCollection(db);
 
+  const ownerUserId = await resolveOwnerUserIdForInbound(db, msg);
+  if (!ownerUserId) {
+    console.warn("[Webhook] Unknown tenant for phone_number_id", msg.phoneNumberId);
+    return { skipped: true, reason: "unknown_tenant" };
+  }
+  const ownerHex = ownerUserId.toHexString();
+
   const events: WebhookEvent[] = [];
   function addEvent(type: WebhookEvent["type"], data?: Record<string, unknown>, durationMs?: number) {
     events.push({ type, timestamp: new Date(), data, durationMs });
   }
 
   // ── 1. Deduplicate ──────────────────────────────────────────────────────────
-  const existing = await logsCol.findOne({ waMessageId: msg.waMessageId });
+  const existing = await logsCol.findOne({ userId: ownerUserId, waMessageId: msg.waMessageId });
   if (existing) {
     console.log(`[Webhook] Duplicate message ${msg.waMessageId} — skipping`);
     return { skipped: true, reason: "duplicate" };
@@ -171,10 +206,12 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   const t2 = Date.now();
   const displayPhone = formatLeadPhoneFromRaw(msg.from);
 
-  const existingLead = await findLeadByCanonicalPhone(leadsCol, msg.from);
+  const existingLead = await findLeadByCanonicalPhone(leadsCol, ownerUserId, msg.from);
   let leadId: string;
   let leadName: string;
-  const leadFilter = existingLead ? { _id: existingLead._id } : { phone: displayPhone };
+  const leadFilter = existingLead
+    ? { _id: existingLead._id }
+    : { userId: ownerUserId, phone: displayPhone };
 
   if (existingLead) {
     leadId   = existingLead._id!.toHexString();
@@ -195,13 +232,14 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     // Auto-create lead from WhatsApp contact
     const now = new Date();
     const result = await leadsCol.insertOne({
+      userId:        ownerUserId,
       name:          msg.senderName,
       phone:         displayPhone,
       source:        "WhatsApp",
       status:        "New",
       conversationStatus: "new_inquiry",
       lastMessage:   msg.text,
-      interestScore: 50,
+      interestScore: 10,
       assignedTo:    "Unassigned",
       lastFollowup:  "Just now",
       lastInboundAt: msg.timestamp,
@@ -215,9 +253,10 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 3. Claim inbound message atomically (idempotency lock) ──────────────────
   const inboundClaim = await messagesCol.updateOne(
-    { waMessageId: msg.waMessageId },
+    { userId: ownerUserId, waMessageId: msg.waMessageId },
     {
       $setOnInsert: {
+        userId:        ownerUserId,
         waMessageId:   msg.waMessageId,
         from:          msg.from,
         senderName:    msg.senderName,
@@ -235,10 +274,10 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   }
 
   // ── 4. Load settings ────────────────────────────────────────────────────────
-  const settings = await getOrCreateSettings(db);
+  const settings = await getOrCreateSettings(db, ownerUserId);
   const waConfig: WhatsAppRuntimeConfig | undefined =
     resolveWhatsAppRuntimeConfig(settings);
-  const qrConnected = getQrSnapshot().state === "connected";
+  const qrConnected = getQrSnapshot(ownerHex).state === "connected";
 
   if (existingLead?.needsHuman) {
     addEvent("reply_skipped", { reason: "human handover active; waiting for team reply" });
@@ -252,13 +291,22 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
         },
       }
     ).catch(() => {});
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "handover" });
+    const leadHandoverEarly = await leadsCol.findOne(leadFilter);
+    if (leadHandoverEarly) {
+      await syncAutoFollowupQueueFromLead(db, ownerUserId, leadHandoverEarly, settings).catch(() => {});
+    }
+    await refreshLeadInterestScoreFromWaThread(db, ownerUserId, msg.from, displayPhone).catch(() => {});
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "handover" });
     return { leadId, status: "handover" };
   }
 
   if (qrConnected) {
     addEvent("reply_skipped", { reason: "QR auto-reply active; skipping webhook auto-reply to avoid duplicates" });
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "skipped" });
+    const leadQrSkip = await leadsCol.findOne(leadFilter);
+    if (leadQrSkip) {
+      await syncAutoFollowupQueueFromLead(db, ownerUserId, leadQrSkip, settings).catch(() => {});
+    }
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }
 
@@ -267,7 +315,12 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 5. Fetch recent conversation for context ────────────────────────────────
   const recentMessages = await messagesCol
-    .find(mongoMatchStoredWaFrom(msg.from))
+    .find(
+      mongoMatchStoredWaFromForUser(
+        ownerUserId,
+        canonicalWaContactKey(msg.from) || String(msg.from)
+      )
+    )
     .sort({ timestamp: -1 })
     .limit(20)
     .toArray();
@@ -282,14 +335,15 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   const shouldEscalate = shouldEscalateConversation({
     latestText: msg.text,
     keywords: settings.humanHandoverKeywords,
-    analysisNeedsHuman: analysis.needsHuman,
-    sentiment: analysis.sentiment,
   });
+
+  const interestScore = clampAiInterestScore0to100(analysis.leadScore);
 
   addEvent("analyzed", {
     language:   analysis.language,
     sentiment:  analysis.sentiment,
     leadScore:  analysis.leadScore,
+    interestScore,
     stage:      analysis.stage,
     needsHuman: analysis.needsHuman,
     confidence: analysis.confidence,
@@ -298,8 +352,8 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 7. Update lead score + status ────────────────────────────────────────────
   const newStatus =
-    analysis.leadScore >= 75 ? "Hot" :
-    analysis.leadScore >= 35 ? "New" : "Silent";
+    interestScore >= 75 ? "Hot" :
+    interestScore >= 35 ? "New" : "Silent";
   const conversationStatus = getConversationStatus({
     lastInboundAt: msg.timestamp,
     lastOutboundAt: existingLead?.lastOutboundAt,
@@ -310,7 +364,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     leadFilter,
     {
       $set: {
-        interestScore: analysis.leadScore,
+        interestScore,
         status: newStatus,
         preferredLanguage: analysis.language,
         needsHuman: shouldEscalate,
@@ -320,10 +374,15 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     }
   ).catch(() => {});
 
+  const leadAfterScore = await leadsCol.findOne(leadFilter);
+  if (leadAfterScore) {
+    await syncAutoFollowupQueueFromLead(db, ownerUserId, leadAfterScore, settings).catch(() => {});
+  }
+
   // ── 8. Handover check ────────────────────────────────────────────────────────
   if (shouldEscalate) {
     addEvent("handover_flagged", {
-      reason: `Keywords or sentiment triggered human handover`,
+      reason: `Handover keywords or anger/frustration pattern in the latest message`,
       leadId,
       leadName,
     });
@@ -341,25 +400,28 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
       }
     ).catch(() => {});
 
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "handover" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "handover" });
     return { leadId, status: "handover" };
   }
 
   // ── 9. Auto-reply gate ───────────────────────────────────────────────────────
   if (!settings.autoReply) {
     addEvent("reply_skipped", { reason: "autoReply is disabled in settings" });
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "skipped" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }
 
   const alreadyReplied = await messagesCol.findOne({
-    ...mongoMatchStoredWaFrom(msg.from),
+    ...mongoMatchStoredWaFromForUser(
+      ownerUserId,
+      canonicalWaContactKey(msg.from) || String(msg.from)
+    ),
     direction: "out",
     timestamp: { $gte: msg.timestamp },
   });
   if (alreadyReplied) {
     addEvent("reply_skipped", { reason: "Outbound reply already exists for this inbound window" });
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "skipped" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }
 
@@ -394,14 +456,14 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     sendResult = await sendTextMessage(msg.from, safeReplyText, waConfig);
     sendChannel = "cloud";
     if ((!sendResult.ok || sendResult.mode === "dry-run") && qrConnected) {
-      const qrSend = await sendQrTextMessage(msg.from, safeReplyText);
+      const qrSend = await sendQrTextMessage(ownerHex, msg.from, safeReplyText);
       if (qrSend.ok) {
         sendResult = { ok: true, messageId: qrSend.messageId, mode: "live" };
         sendChannel = "qr";
       }
     }
   } else if (qrConnected) {
-    const qrSend = await sendQrTextMessage(msg.from, safeReplyText);
+    const qrSend = await sendQrTextMessage(ownerHex, msg.from, safeReplyText);
     if (qrSend.ok) {
       sendResult = { ok: true, messageId: qrSend.messageId, mode: "live" };
       sendChannel = "qr";
@@ -420,7 +482,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
       mode: sendResult.mode,
       durationMs: Date.now() - t10,
     });
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "error" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "error" });
     return { leadId, status: "send_error", error: "QR send failed and Cloud API is not configured." };
   }
 
@@ -432,7 +494,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
       mode:   sendResult.mode,
       durationMs: Date.now() - t10,
     });
-    await persistLog({ logsCol, msg, leadId, leadName, events, status: "error" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "error" });
     return {
       leadId,
       status: "send_error",
@@ -444,9 +506,10 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
 
   // ── 12. Save outgoing message ────────────────────────────────────────────────
   await messagesCol.updateOne(
-    { waMessageId: sendResult.messageId },
+    { userId: ownerUserId, waMessageId: sendResult.messageId },
     {
       $setOnInsert: {
+        userId:        ownerUserId,
         waMessageId:   sendResult.messageId,
         from:          msg.from,
         senderName:    "SATYAM AI",
@@ -460,17 +523,29 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   ).catch(() => {});
 
   // Update lead's lastFollowup
-  await leadsCol.updateOne(
-    leadFilter,
-    {
-      $set: {
-        lastFollowup: "Just now",
-        lastOutboundAt: new Date(),
-        needsHuman: false,
-        conversationStatus: "awaiting_customer_reply",
-        updatedAt: new Date(),
-      },
-    }
+    await leadsCol.updateOne(
+      leadFilter,
+      {
+        $set: {
+          lastFollowup: "Just now",
+          lastOutboundAt: new Date(),
+          needsHuman: false,
+          conversationStatus: "awaiting_customer_reply",
+          updatedAt: new Date(),
+        },
+      }
+    ).catch(() => {});
+
+  const leadAfterReply = await leadsCol.findOne(leadFilter);
+  if (leadAfterReply) {
+    await syncAutoFollowupQueueFromLead(db, ownerUserId, leadAfterReply, settings).catch(() => {});
+  }
+
+  await refreshLeadInterestScoreFromWaThread(
+    db,
+    ownerUserId,
+    msg.from,
+    displayPhone
   ).catch(() => {});
 
   addEvent("replied", {
@@ -484,13 +559,23 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     durationMs:   Date.now() - t10,
   });
 
-  await persistLog({ logsCol, msg, leadId, leadName, events, status: "processed", replyText: safeReplyText });
+  await persistLog({
+    userId: ownerUserId,
+    logsCol,
+    msg,
+    leadId,
+    leadName,
+    events,
+    status: "processed",
+    replyText: safeReplyText,
+  });
   return { leadId, status: "replied", mode: sendResult.mode };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function persistLog({
+  userId,
   logsCol,
   msg,
   leadId,
@@ -499,6 +584,7 @@ async function persistLog({
   status,
   replyText,
 }: {
+  userId:     ObjectId;
   logsCol:    ReturnType<typeof webhookLogsCollection>;
   msg:        ParsedWaMessage;
   leadId:     string;
@@ -509,6 +595,7 @@ async function persistLog({
 }) {
   const now = new Date();
   await logsCol.insertOne({
+    userId,
     waMessageId: msg.waMessageId,
     from:        msg.from,
     senderName:  msg.senderName,

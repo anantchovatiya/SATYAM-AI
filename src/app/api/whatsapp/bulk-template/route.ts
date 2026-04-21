@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { getOrCreateSettings } from "@/lib/models/settings";
+import { requireApiUser } from "@/lib/auth/session";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import {
   resolveWhatsAppRuntimeConfig,
@@ -21,6 +22,10 @@ function sleep(ms: number): Promise<void> {
 
 export async function POST(req: NextRequest) {
   try {
+    const auth = await requireApiUser(req);
+    if (auth instanceof Response) return auth;
+    const { userId } = auth;
+
     const body = (await req.json()) as {
       templateName?: string;
       languageCode?: string;
@@ -90,7 +95,7 @@ export async function POST(req: NextRequest) {
     }
 
     const db = await getDb();
-    const settings = await getOrCreateSettings(db);
+    const settings = await getOrCreateSettings(db, userId);
     const waConfig: WhatsAppRuntimeConfig | undefined = resolveWhatsAppRuntimeConfig(settings);
 
     if (!waConfig?.token || !waConfig?.phoneNumberId) {
@@ -116,9 +121,10 @@ export async function POST(req: NextRequest) {
           const fromKey = canonicalWaContactKey(to) || to;
           await messagesCol
             .updateOne(
-              { waMessageId: res.messageId },
+              { userId, waMessageId: res.messageId },
               {
                 $setOnInsert: {
+                  userId,
                   waMessageId: res.messageId,
                   from: fromKey,
                   senderName: "SATYAM AI",

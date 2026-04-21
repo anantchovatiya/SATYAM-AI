@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { BarChart3, Bot, LayoutDashboard, Menu, MessageSquare, Mails, Settings2, Sparkles, Users, X } from "lucide-react";
-import { useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { BarChart3, Bot, LayoutDashboard, LogOut, Menu, MessageSquare, Mails, Settings2, Sparkles, Users, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import { cn } from "@/lib/cn";
 import { ThemeToggle } from "./theme-toggle";
+
+type MeUser = { id: string; email: string; name: string };
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -61,6 +63,31 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
+  const router = useRouter();
+  const [user, setUser] = useState<MeUser | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/auth/me", { credentials: "include" });
+        const data = (await res.json()) as { user?: MeUser | null };
+        if (!cancelled) setUser(res.ok && data.user ? data.user : null);
+      } catch {
+        if (!cancelled) setUser(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const logout = useCallback(async () => {
+    await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+    setUser(null);
+    router.push("/login");
+    router.refresh();
+  }, [router]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -87,9 +114,31 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             >
               {open ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
             </button>
-            <p className="hidden text-sm text-slate-500 md:block dark:text-slate-400">
-              Premium CRM dashboard for growth teams
-            </p>
+            <div className="flex min-w-0 flex-1 items-center justify-end gap-2 sm:gap-3">
+              {user === undefined ? (
+                <span className="text-sm text-slate-400">…</span>
+              ) : user ? (
+                <>
+                  <span
+                    className="hidden max-w-[200px] truncate text-sm text-slate-600 sm:inline dark:text-slate-300 md:max-w-[320px]"
+                    title={user.email}
+                  >
+                    <span className="font-medium text-slate-800 dark:text-slate-100">{user.name}</span>
+                    <span className="text-slate-400"> · </span>
+                    {user.email}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void logout()}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    title="Log out"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">Log out</span>
+                  </button>
+                </>
+              ) : null}
+            </div>
             <ThemeToggle />
           </header>
           <div className="p-4 md:p-6">{children}</div>

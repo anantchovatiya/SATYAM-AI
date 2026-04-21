@@ -1,4 +1,4 @@
-import { type Collection, type Db } from "mongodb";
+import { ObjectId, type Collection, type Db } from "mongodb";
 
 export type AiTone = "friendly" | "professional" | "premium";
 
@@ -13,11 +13,16 @@ export interface WhatsAppConnectionSettings {
 }
 
 export interface AutomationSettings {
-  _id?: unknown;
-  workspaceId: string;       // single workspace for now → "default"
+  _id?: ObjectId;
+  /** Tenant owner — every row must have this after migration. */
+  userId?: ObjectId;
+  /** @deprecated Legacy single-tenant key; use userId. */
+  workspaceId?: string;
   whatsappEnvDisabled?: boolean;
   autoReply: boolean;
   followUpDelayDays: number;
+  /** Only run auto follow-up when `lead.interestScore` is at least this (0 = no minimum). */
+  followUpMinInterestScore: number;
   humanHandoverKeywords: string[];
   languageMirrorMode: boolean;
   businessCardAutoSend: boolean;
@@ -33,10 +38,10 @@ export interface AutomationSettings {
   updatedAt: Date;
 }
 
-export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id"> = {
-  workspaceId: "default",
+export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id" | "userId"> = {
   autoReply: true,
   followUpDelayDays: 2,
+  followUpMinInterestScore: 0,
   humanHandoverKeywords: ["price", "discount", "urgent", "complaint"],
   languageMirrorMode: true,
   businessCardAutoSend: false,
@@ -53,21 +58,51 @@ export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id"> = {
   updatedAt: new Date(),
 };
 
+/** Safe to pass from Server Components → client (no `ObjectId` / BSON types). */
+export type AutomationSettingsClient = Omit<AutomationSettings, "_id" | "userId">;
+
+export function stripSettingsForClient(doc: AutomationSettings): AutomationSettingsClient {
+  const { _id, userId, ...rest } = doc;
+  void _id;
+  void userId;
+  return rest;
+}
+
 export function settingsCollection(db: Db): Collection<AutomationSettings> {
   return db.collection<AutomationSettings>("settings");
 }
 
-export async function getOrCreateSettings(db: Db): Promise<AutomationSettings> {
+export async function getOrCreateSettings(db: Db, userId: ObjectId): Promise<AutomationSettings> {
   const col = settingsCollection(db);
-  const doc = await col.findOne({ workspaceId: "default" });
+  const doc = await col.findOne({ userId });
   if (doc) {
     return {
       ...DEFAULT_SETTINGS,
       ...doc,
-      workspaceId: "default",
+      userId,
+      followUpMinInterestScore:
+        typeof doc.followUpMinInterestScore === "number" ? doc.followUpMinInterestScore : DEFAULT_SETTINGS.followUpMinInterestScore,
     };
   }
 
-  await col.insertOne({ ...DEFAULT_SETTINGS, updatedAt: new Date() });
-  return { ...DEFAULT_SETTINGS };
+  await col.insertOne({
+    ...DEFAULT_SETTINGS,
+    userId,
+    updatedAt: new Date(),
+  });
+
+  return { ...DEFAULT_SETTINGS, userId, updatedAt: new Date() };
+}
+
+export async function findSettingsByPhoneNumberId(
+  db: Db,
+  phoneNumberId: string
+): Promise<AutomationSettings | null> {
+  if (!phoneNumberId) return null;
+  return settingsCollection(db).findOne({ "whatsapp.phoneNumberId": phoneNumberId });
+}
+
+export async function findSettingsByVerifyToken(db: Db, token: string): Promise<AutomationSettings | null> {
+  if (!token) return null;
+  return settingsCollection(db).findOne({ "whatsapp.verifyToken": token });
 }

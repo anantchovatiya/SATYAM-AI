@@ -1,20 +1,21 @@
+import { redirect } from "next/navigation";
 import { getDb } from "@/lib/mongodb";
-import { getOrCreateSettings } from "@/lib/models/settings";
+import { getOrCreateSettings, stripSettingsForClient } from "@/lib/models/settings";
 import { AutomationClient } from "./automation-client";
 import { DbError } from "@/components/db-error";
+import { getServerSessionUser } from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
 
 export default async function AutomationPage() {
   try {
+    const session = await getServerSessionUser();
+    if (!session) redirect("/login");
+    const { userId } = session;
+
     const db = await getDb();
-    const settings = await getOrCreateSettings(db);
-
-    // Strip _id (not serialisable) before passing to client component
-    const { _id, ...initial } = settings as typeof settings & { _id?: unknown };
-    void _id;
-
-    return <AutomationClient initial={initial} />;
+    const settings = await getOrCreateSettings(db, userId);
+    return <AutomationClient initial={stripSettingsForClient(settings)} />;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return <DbError message={msg} />;

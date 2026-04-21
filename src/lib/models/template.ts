@@ -4,6 +4,7 @@ export type TemplateChannel = "WhatsApp" | "Email" | "SMS";
 
 export interface TemplateDoc {
   _id?: ObjectId;
+  userId?: ObjectId;
   name: string;
   channel: TemplateChannel;
   body: string;       // message body / content
@@ -22,6 +23,6 @@ export function templatesCollection(db: Db): Collection<TemplateDoc> {
 }
 
 export function templateDocToRow(doc: TemplateDoc): TemplateRow {
-  const { _id, ...rest } = doc;
+  const { _id, userId: _uid, ...rest } = doc;
   return { id: _id!.toHexString(), ...rest };
 }

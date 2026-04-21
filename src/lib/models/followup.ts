@@ -4,6 +4,7 @@ export type FollowupStatus = "Pending" | "Done" | "Skipped";
 
 export interface FollowupDoc {
   _id?: ObjectId;
+  userId?: ObjectId;
   leadId: string;      // references leads._id hex
   leadName: string;
   phone: string;

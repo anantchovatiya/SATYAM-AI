@@ -1,9 +1,11 @@
+import { redirect } from "next/navigation";
 import { getDb }               from "@/lib/mongodb";
 import { leadsCollection }     from "@/lib/models/lead";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { followupsCollection } from "@/lib/models/followup";
 import { AnalyticsClient }     from "./analytics-client";
 import { DbError }             from "@/components/db-error";
+import { getServerSessionUser } from "@/lib/auth/session";
 import type { AnalyticsSummary, DailyPoint, SalespersonStat, ResponsePoint } from "@/lib/analytics-data";
 
 export const dynamic = "force-dynamic";
@@ -34,6 +36,10 @@ function fmtDay(iso: string): string {
 
 export default async function AnalyticsPage() {
   try {
+    const session = await getServerSessionUser();
+    if (!session) redirect("/login");
+    const { userId } = session;
+
     const db    = await getDb();
     const lCol  = leadsCollection(db);
     const mCol  = waMessagesCollection(db);
@@ -56,50 +62,50 @@ export default async function AnalyticsPage() {
       msgPairsRaw,
       responseWeekRaw,
     ] = await Promise.all([
-      lCol.countDocuments(),
-      lCol.countDocuments({ status: "Hot" }),
-      lCol.countDocuments({ status: "Closed" }),
+      lCol.countDocuments({ userId }),
+      lCol.countDocuments({ userId, status: "Hot" }),
+      lCol.countDocuments({ userId, status: "Closed" }),
 
       // Per-salesperson breakdown
-      lCol.find({}, { projection: { assignedTo: 1, status: 1 } }).toArray(),
+      lCol.find({ userId }, { projection: { assignedTo: 1, status: 1 } }).toArray(),
 
       // Daily leads created (last 30 days)
       lCol.aggregate<{ _id: string; count: number }>([
-        { $match: { createdAt: { $gte: since30 } } },
+        { $match: { userId, createdAt: { $gte: since30 } } },
         { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       ]).toArray(),
 
       // Daily outbound messages (last 30 days)
       mCol.aggregate<{ _id: string; count: number }>([
-        { $match: { direction: "out", timestamp: { $gte: since30 } } },
+        { $match: { userId, direction: "out", timestamp: { $gte: since30 } } },
         { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$timestamp" } }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       ]).toArray(),
 
       // Daily followups created (last 30 days)
       fCol.aggregate<{ _id: string; count: number }>([
-        { $match: { createdAt: { $gte: since30 } } },
+        { $match: { userId, createdAt: { $gte: since30 } } },
         { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       ]).toArray(),
 
       // Total replies ever
-      mCol.countDocuments({ direction: "out" }),
+      mCol.countDocuments({ userId, direction: "out" }),
 
       // Total followups ever
-      fCol.countDocuments(),
+      fCol.countDocuments({ userId }),
 
       // Avg response time — pair in → out messages per phone, last 7 days
       mCol.aggregate<{ _id: string; messages: { dir: string; ts: Date }[] }>([
-        { $match: { timestamp: { $gte: since7 } } },
+        { $match: { userId, timestamp: { $gte: since7 } } },
         { $sort:  { from: 1, timestamp: 1 } },
         { $group: { _id: "$from", messages: { $push: { dir: "$direction", ts: "$timestamp" } } } },
       ]).toArray(),
 
       // Avg response time per day of week (last 30 days outbound)
       mCol.aggregate<{ _id: number; avgMs: number }>([
-        { $match: { direction: "out", timestamp: { $gte: since30 } } },
+        { $match: { userId, direction: "out", timestamp: { $gte: since30 } } },
         { $group: {
           _id: { $dayOfWeek: "$timestamp" }, // 1=Sun…7=Sat
           avgTs: { $avg: { $toLong: "$timestamp" } },

@@ -1,23 +1,30 @@
 import { NextRequest, NextResponse } from "next/server";
+import type { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
 import { settingsCollection, getOrCreateSettings } from "@/lib/models/settings";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { getQrSnapshot, startQrConnection, stopQrConnection } from "@/lib/whatsapp-qr-connector";
 import { getBusinessCardCount } from "@/lib/business-card";
+import { requireApiUser } from "@/lib/auth/session";
 
 const GRAPH_API_VERSION = "v19.0";
 const GRAPH_BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const auth = await requireApiUser(req);
+    if (auth instanceof Response) return auth;
+    const { userId } = auth;
+    const userIdHex = userId.toHexString();
+
     const db = await getDb();
-    const settings = await getOrCreateSettings(db);
+    const settings = await getOrCreateSettings(db, userId);
     const [stats, businessCardsCollected] = await Promise.all([
-      getSyncStats(db),
-      getBusinessCardCount(),
+      getSyncStats(db, userId),
+      getBusinessCardCount(userIdHex),
     ]);
-    const qr = getQrSnapshot();
+    const qr = getQrSnapshot(userIdHex);
 
     const hasStoredConnection = Boolean(
       settings.whatsapp?.token && settings.whatsapp.phoneNumberId
@@ -60,6 +67,11 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    const auth = await requireApiUser(req);
+    if (auth instanceof Response) return auth;
+    const { userId } = auth;
+    const userIdHex = userId.toHexString();
+
     const body = (await req.json()) as {
       action?: string;
       token?: string;
@@ -69,10 +81,10 @@ export async function POST(req: NextRequest) {
 
     if (body.action === "sync") {
       const db = await getDb();
-      const settings = await getOrCreateSettings(db);
-      const hasConnection = Boolean(
-        settings.whatsapp?.token && settings.whatsapp.phoneNumberId
-      ) || Boolean(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID);
+      const settings = await getOrCreateSettings(db, userId);
+      const hasConnection =
+        Boolean(settings.whatsapp?.token && settings.whatsapp.phoneNumberId) ||
+        Boolean(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID);
 
       if (!hasConnection) {
         return NextResponse.json(
@@ -81,33 +93,33 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const sync = await syncWhatsAppData(db);
+      const sync = await syncWhatsAppData(db, userId);
       return NextResponse.json({ ok: true, connected: true, sync });
     }
 
     if (body.action === "qr_start") {
-      const qr = await startQrConnection();
+      const qr = await startQrConnection(userIdHex);
       return NextResponse.json({ ok: true, qr });
     }
 
     if (body.action === "qr_restart") {
-      const qr = await startQrConnection(true);
+      const qr = await startQrConnection(userIdHex, true);
       return NextResponse.json({ ok: true, qr });
     }
 
     if (body.action === "qr_status") {
-      return NextResponse.json({ ok: true, qr: getQrSnapshot() });
+      return NextResponse.json({ ok: true, qr: getQrSnapshot(userIdHex) });
     }
 
     if (body.action === "qr_disconnect") {
-      await stopQrConnection();
+      await stopQrConnection(userIdHex);
       return NextResponse.json({ ok: true });
     }
 
     if (body.action === "cloud_disconnect") {
       const db = await getDb();
       await settingsCollection(db).updateOne(
-        { workspaceId: "default" },
+        { userId },
         {
           $unset: { whatsapp: "" },
           $set: { whatsappEnvDisabled: true, updatedAt: new Date() },
@@ -120,7 +132,7 @@ export async function POST(req: NextRequest) {
     if (body.action === "cloud_reconnect_env") {
       const db = await getDb();
       await settingsCollection(db).updateOne(
-        { workspaceId: "default" },
+        { userId },
         { $set: { whatsappEnvDisabled: false, updatedAt: new Date() } },
         { upsert: true }
       );
@@ -167,10 +179,10 @@ export async function POST(req: NextRequest) {
     const now = new Date();
 
     await col.updateOne(
-      { workspaceId: "default" },
+      { userId },
       {
         $set: {
-          workspaceId: "default",
+          userId,
           updatedAt: now,
           whatsapp: {
             token,
@@ -185,8 +197,6 @@ export async function POST(req: NextRequest) {
       { upsert: true }
     );
 
-    // Contact sync is NOT run automatically on connect — only new inbound
-    // webhook messages will create leads. Use action:"sync" to manually import.
     return NextResponse.json({
       ok: true,
       connected: true,
@@ -199,7 +209,7 @@ export async function POST(req: NextRequest) {
   }
 }
 
-async function syncWhatsAppData(db: Awaited<ReturnType<typeof getDb>>) {
+async function syncWhatsAppData(db: Awaited<ReturnType<typeof getDb>>, userId: ObjectId) {
   const leadsCol = leadsCollection(db);
   const messagesCol = waMessagesCollection(db);
 
@@ -210,6 +220,7 @@ async function syncWhatsAppData(db: Awaited<ReturnType<typeof getDb>>) {
       lastText: string;
       lastTimestamp: Date;
     }>([
+      { $match: { userId } },
       { $sort: { timestamp: -1 } },
       {
         $group: {
@@ -237,16 +248,18 @@ async function syncWhatsAppData(db: Awaited<ReturnType<typeof getDb>>) {
 
   for (const contact of contacts) {
     const normalizedPhone = normalizePhone(contact.from);
-    const lead = await leadsCol.findOne({ phone: normalizedPhone });
+    const lead = await leadsCol.findOne({ userId, phone: normalizedPhone });
 
     if (!lead) {
+      const importScore = contact.lastText?.trim() ? 35 : 10;
       await leadsCol.insertOne({
+        userId,
         name: contact.senderName ?? normalizedPhone,
         phone: normalizedPhone,
         source: "WhatsApp",
         status: "New",
         lastMessage: contact.lastText,
-        interestScore: 50,
+        interestScore: importScore || 10,
         assignedTo: "Unassigned",
         lastFollowup: "Just now",
         createdAt: now,
@@ -271,23 +284,23 @@ async function syncWhatsAppData(db: Awaited<ReturnType<typeof getDb>>) {
   }
 
   await settingsCollection(db).updateOne(
-    { workspaceId: "default" },
+    { userId },
     { $set: { "whatsapp.lastSyncAt": now, updatedAt: now } }
   );
 
-  const stats = await getSyncStats(db);
+  const stats = await getSyncStats(db, userId);
   return { imported, updated, ...stats, syncedAt: now };
 }
 
-async function getSyncStats(db: Awaited<ReturnType<typeof getDb>>) {
+async function getSyncStats(db: Awaited<ReturnType<typeof getDb>>, userId: ObjectId) {
   const messagesCol = waMessagesCollection(db);
   const leadsCol = leadsCollection(db);
 
   const [totalMessages, totalWhatsAppLeads, contacts, latestMessage] = await Promise.all([
-    messagesCol.countDocuments(),
-    leadsCol.countDocuments({ source: "WhatsApp" }),
-    messagesCol.distinct("from"),
-    messagesCol.find({}).sort({ timestamp: -1 }).limit(1).toArray(),
+    messagesCol.countDocuments({ userId }),
+    leadsCol.countDocuments({ userId, source: "WhatsApp" }),
+    messagesCol.distinct("from", { userId }),
+    messagesCol.find({ userId }).sort({ timestamp: -1 }).limit(1).toArray(),
   ]);
 
   return {

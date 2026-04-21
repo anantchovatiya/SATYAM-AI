@@ -23,6 +23,7 @@ export interface WebhookEvent {
 // ── Stored message document ───────────────────────────────────────────────────
 
 export interface WaMessage {
+  userId?: ObjectId;
   waMessageId: string;   // Meta message ID (unique)
   from: string;          // sender phone e.g. "919810011223"
   remoteJid?: string;    // exact WhatsApp chat JID, e.g. "12345@lid"
@@ -37,6 +38,7 @@ export interface WaMessage {
 
 export interface WebhookLog {
   _id?: ObjectId;
+  userId?: ObjectId;
   waMessageId: string;      // dedup key
   from: string;
   senderName?: string;
@@ -61,8 +63,19 @@ export function waMessagesCollection(db: Db): Collection<WaMessage> {
 }
 
 export async function ensureIndexes(db: Db) {
-  await webhookLogsCollection(db).createIndex({ waMessageId: 1 }, { unique: true });
-  await webhookLogsCollection(db).createIndex({ from: 1, createdAt: -1 });
-  await waMessagesCollection(db).createIndex({ waMessageId: 1 }, { unique: true });
-  await waMessagesCollection(db).createIndex({ from: 1, timestamp: -1 });
+  const logs = webhookLogsCollection(db);
+  const msgs = waMessagesCollection(db);
+  for (const col of [logs, msgs]) {
+    const idx = await col.indexes().catch(() => [] as { name?: string }[]);
+    for (const i of idx) {
+      if (i.name === "waMessageId_1") {
+        await col.dropIndex("waMessageId_1").catch(() => {});
+      }
+    }
+  }
+  await logs.createIndex({ userId: 1, waMessageId: 1 }, { unique: true });
+  await logs.createIndex({ userId: 1, from: 1, createdAt: -1 });
+  await msgs.createIndex({ userId: 1, waMessageId: 1 }, { unique: true });
+  await msgs.createIndex({ userId: 1, from: 1, timestamp: -1 });
+  await msgs.createIndex({ userId: 1, direction: 1, phoneNumberId: 1, timestamp: -1 });
 }
