@@ -7,7 +7,7 @@ import { leadsCollection } from "@/lib/models/lead";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
-import { analyzeChat, generateReply, type IncomingMessage, type AnalyzeResult } from "@/lib/ai";
+import { analyzeChat, generateReply, type AnalyzeResult } from "@/lib/ai";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getEffectiveKnowledge } from "@/lib/knowledge";

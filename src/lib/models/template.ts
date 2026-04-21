@@ -23,6 +23,7 @@ export function templatesCollection(db: Db): Collection<TemplateDoc> {
 }
 
 export function templateDocToRow(doc: TemplateDoc): TemplateRow {
-  const { _id, userId: _uid, ...rest } = doc;
+  const { _id, userId, ...rest } = doc;
+  void userId;
   return { id: _id!.toHexString(), ...rest };
 }

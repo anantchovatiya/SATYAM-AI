@@ -38,6 +38,7 @@ export function leadsCollection(db: Db): Collection<LeadDoc> {
 }
 
 export function docToRow(doc: LeadDoc): LeadRow {
-  const { _id, userId: _uid, ...rest } = doc;
+  const { _id, userId, ...rest } = doc;
+  void userId;
   return { id: _id!.toHexString(), ...rest };
 }
