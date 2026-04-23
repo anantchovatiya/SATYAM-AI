@@ -6,9 +6,11 @@
  * 2) OpenAI (OPENAI_API_KEY)
  * 3) Deterministic heuristic fallback
  *
- * Interest (`leadScore`): Gemini-only mini call on the last
- * `INTEREST_SCORE_MESSAGE_WINDOW` messages; full `analyzeChat` also uses a dual-window
- * prompt so the main model aligns `leadScore` with that window when Gemini/OpenAI run.
+ * Interest (`leadScore`): primarily from the last `INTEREST_SCORE_MESSAGE_WINDOW` messages
+ * (inbound + outbound), via `resolveGeminiLeadScoreLast5` / `geminiInterestScoreFromMessages` —
+ * not from a single last message. A wider-thread commerce floor corrects the score when
+ * the model only sees a short “ok / yes I see” tail but quantity/order context is one screen up.
+ * Full `analyzeChat` still uses a dual-window prompt for language / sentiment / stage.
  */
 import OpenAI from "openai";
 
@@ -189,14 +191,20 @@ const TONE_SYSTEM: Record<string, string> = {
     "You are a concise, authoritative advisor for a premium product. Responses should be brief, confident, and value-focused — no filler.",
 };
 
-/** Shown in analyzeChat system prompts so models align tiers and outbound context. */
-const LEAD_SCORE_RUBRIC = `leadScore (integer 0-100): buying strength for THIS lead from the FULL thread (LEAD + AGENT). Use AGENT lines for quantities, SKUs, prices, shipping, and order confirmation.
+/**
+ * Shown in interest-only mini prompts. Score reflects the last
+ * `INTEREST_SCORE_MESSAGE_WINDOW` messages only (both LEAD and AGENT) — not one message, not
+ * the whole chat history. Agent lines still count: quantities, SKUs, prices, shipping, confirmations.
+ */
+const LEAD_SCORE_RUBRIC = `leadScore (integer 0-100): buying strength from ONLY these messages (LEAD + AGENT, in order). Do not infer from older history outside this window.
 Bands: 0-15 greetings or chit-chat only; 16-40 light product mentions without commitment; 41-60 product interest, specs, catalogue, "send details"; 61-78 pricing, MOQ, delivery, negotiation, piece/qty talk; 79-100 firm purchase intent or order step (confirm order, committed qty, invoice/payment, agent confirms their order). If the agent confirms an order or the lead commits qty/SKU, use at least 85 unless the lead clearly cancelled.
-IMPORTANT: If the RECENT lines are only from AGENT but they say the order is packed, shipping, dispatched, confirmed, payment received, out for delivery, or "getting your order ready" / similar fulfillment — that means an active sale; use leadScore 88–98 (not 30–45). Low scores are wrong when the business is clearly fulfilling an order for this chat.
-confidence (0-1): how sure you are; use roughly 0.85-1 when evidence is explicit (numbers, "confirm", "order", prices), and 0.45-0.7 when the thread is vague.`;
+If the last LEAD line is a short ack ("yes I see", "ok", "got it", "sounds good") but the same window still contains the AGENT recapping a concrete quantity, SKU, or "we can get that order ready" for them, treat the thread as high intent: use at least 72–90 (acknowledging an order discussion is not a 30–50 score).
+IMPORTANT: If the last messages are mostly from AGENT but they say the order is packed, shipping, dispatched, confirmed, payment received, out for delivery, or "getting your order ready" / similar fulfillment — that means an active sale; use leadScore 88–98 (not 30–45). If AGENT says they are getting that order ready / "we can definitely get that order" (even before ship), that is also strong: use 82–95.
+Low scores are wrong when the business is clearly discussing or fulfilling a concrete order in this window.
+confidence (0-1): how sure you are; use roughly 0.85-1 when evidence is explicit (numbers, "confirm", "order", prices), and 0.45-0.7 when the window is vague.`;
 
 /** Last N turns used for Gemini interest-only scoring and for the RECENT_WINDOW in analyzeChat. */
-export const INTEREST_SCORE_MESSAGE_WINDOW = 5;
+export const INTEREST_SCORE_MESSAGE_WINDOW = 10;
 
 export function getLastMessagesForInterestScore(messages: IncomingMessage[]): IncomingMessage[] {
   if (messages.length <= INTEREST_SCORE_MESSAGE_WINDOW) return messages;
@@ -210,17 +218,58 @@ function formatChatLines(messages: IncomingMessage[]): string {
 }
 
 /** Agent said order is in fulfillment → floor score so UI is not stuck at neutral when Gemini under-reads AGENT-only tails. */
-const AGENT_FULFILLMENT_RE =
+const AGENT_FULFILLMENT_SHIPPED_RE =
   /\b(getting\s+your\s+order\s+packed|order\s+packed|packed\s+up|packed\s+up\s+and\s+ready|ready\s+to\s+go|on\s+the\s+way|out\s+for\s+delivery|dispatched|shipp(ed|ing)|your\s+order\s+(has\s+been\s+)?(shipped|dispatched|confirmed)|order\s+is\s+confirmed|payment\s+received|invoice\s+paid|tracking\s+(id|number|link))\b/i;
 
 /**
- * Raise `score` when recent AGENT text clearly indicates order fulfillment (even if last messages are all outbound).
+ * Agent commits to a concrete order (qty/product) or “we can get that order ready” before dispatch — not yet shipped, but high intent.
+ */
+const AGENT_ORDER_COMMITMENT_RE =
+  /\b(we\s+can\s+(?:definitely\s+)?get\s+that\s+order|get(?:ting)?\s+that\s+order\s+ready|get\s+that\s+order\s+ready|get\s+that\s+order|definitely\s+get\s+that|that('?s| is)\s+\d{1,5}\s*pieces?|get\s+that\s+order\s+ready\s+for|order\s+ready\s+for\s+you|confirm(?:ed|ing)\s+that|your\s+order\s+of\s+\d{1,5})\b/i;
+
+const WIDE_COMMERCE_LOOKBACK = 25;
+const THREAD_QTY_ORDER_RE = /\b\d{2,5}\s*(?:pieces?|pcs?|nos?|units?)\b/i;
+
+/**
+ * Wider than the last-N window: if quantity/order language appears in recent thread but the model only
+ * scored a short “yes / ok / I see” tail, don’t show a low score (common CRM bug).
+ */
+export function applyCommerceContextFloor(allMessages: IncomingMessage[], score: number): number {
+  const base = clampLeadScore0to100(score);
+  const recent =
+    allMessages.length > WIDE_COMMERCE_LOOKBACK
+      ? allMessages.slice(-WIDE_COMMERCE_LOOKBACK)
+      : allMessages;
+  const blob = formatChatLines(recent).toLowerCase();
+  if (THREAD_QTY_ORDER_RE.test(blob)) {
+    return Math.max(base, 82);
+  }
+  if (
+    /\b(order|quote|moq|proforma|invoice|payment|dispatch|catalogue|send\s+details|brass|spray|sku)\b/.test(
+      blob
+    ) &&
+    (/\b\d{1,5}\b/.test(blob) || AGENT_ORDER_COMMITMENT_RE.test(blob) || /pieces?|pcs?|length|cm|mm/.test(blob))
+  ) {
+    return Math.max(base, 70);
+  }
+  return base;
+}
+
+/**
+ * Raise `score` when recent AGENT text clearly indicates an active sale: shipped/dispatch, or order commitment / qty recap.
  */
 export function applyAgentFulfillmentFloor(window: IncomingMessage[], score: number): number {
   const base = clampLeadScore0to100(score);
-  const hit = window.some((m) => m.direction === "out" && AGENT_FULFILLMENT_RE.test(m.text ?? ""));
-  if (!hit) return base;
-  return Math.max(base, 88);
+  for (const m of window) {
+    if (m.direction !== "out") continue;
+    const t = m.text ?? "";
+    if (AGENT_FULFILLMENT_SHIPPED_RE.test(t)) return Math.max(base, 88);
+  }
+  for (const m of window) {
+    if (m.direction !== "out") continue;
+    if (AGENT_ORDER_COMMITMENT_RE.test(m.text ?? "")) return Math.max(base, 84);
+  }
+  return base;
 }
 
 /** Dual-section transcript: model must base `leadScore` only on RECENT_WINDOW when present. */
@@ -238,7 +287,7 @@ function buildDualWindowAnalyzePrompt(messages: IncomingMessage[]): string {
 }
 
 /**
- * Gemini-only: `leadScore` + `confidence` from the given slice (typically last 5 messages).
+ * Gemini-only: `leadScore` + `confidence` from the given slice (typically last `INTEREST_SCORE_MESSAGE_WINDOW` messages).
  * Returns null if GEMINI_API_KEY is missing or the API fails.
  */
 export async function geminiInterestScoreFromMessages(
@@ -251,7 +300,7 @@ leadScore (integer 0-100), confidence (number 0-1).
 ${LEAD_SCORE_RUBRIC}`,
     prompt: `Chronological messages (${recent.length}):\n${formatChatLines(recent)}`,
     temperature: 0.2,
-    maxOutputTokens: 160,
+    maxOutputTokens: 220,
   });
   if (!text) return null;
   const raw = parseJsonFromText(text);
@@ -260,13 +309,17 @@ ${LEAD_SCORE_RUBRIC}`,
   return { leadScore, confidence };
 }
 
-/** Clamped 0–100; 35 when Gemini is unavailable or fails. */
+/** Clamped 0–100; 35 when Gemini is unavailable or fails. Applies thread commerce floor on full `messages`. */
 export async function resolveGeminiLeadScoreLast5(messages: IncomingMessage[]): Promise<number> {
   const slice = getLastMessagesForInterestScore(messages);
   const w = slice.length ? slice : messages;
   const g = await geminiInterestScoreFromMessages(w.length ? w : messages);
-  if (!g) return applyAgentFulfillmentFloor(w, 35);
-  return applyAgentFulfillmentFloor(w, g.leadScore);
+  if (!g) {
+    const s0 = applyAgentFulfillmentFloor(w, 35);
+    return applyCommerceContextFloor(messages, s0);
+  }
+  const s1 = applyAgentFulfillmentFloor(w, g.leadScore);
+  return applyCommerceContextFloor(messages, s1);
 }
 
 // ── 1. analyzeChat ────────────────────────────────────────────────────────────
@@ -299,13 +352,13 @@ ${LEAD_SCORE_RUBRIC}`,
 
       if (text) {
         const raw = parseJsonFromText(text);
-        const interestWindow = getLastMessagesForInterestScore(messages);
+        const leadScore = await resolveGeminiLeadScoreLast5(messages);
         return {
           language: String(raw.language ?? "English"),
           sentiment: (["positive", "neutral", "negative"].includes(String(raw.sentiment))
             ? raw.sentiment
             : "neutral") as Sentiment,
-          leadScore: applyAgentFulfillmentFloor(interestWindow, leadScoreFromModelOrDefault(raw.leadScore)),
+          leadScore,
           stage: ([
             "awareness",
             "interest",
@@ -353,11 +406,11 @@ When the user message contains ===RECENT_WINDOW===, base leadScore ONLY on that 
       });
 
       const raw = JSON.parse(completion.choices[0].message.content ?? "{}");
-      const interestWindow = getLastMessagesForInterestScore(messages);
+      const leadScore = await resolveGeminiLeadScoreLast5(messages);
       return {
         language:    raw.language   ?? "English",
         sentiment:   raw.sentiment  ?? "neutral",
-        leadScore:   applyAgentFulfillmentFloor(interestWindow, leadScoreFromModelOrDefault(raw.leadScore)),
+        leadScore,
         stage:       raw.stage      ?? "interest",
         needsHuman:  Boolean(raw.needsHuman),
         confidence:  clampAnalyzeConfidence(raw.confidence),

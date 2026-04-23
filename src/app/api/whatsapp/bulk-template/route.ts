@@ -4,6 +4,7 @@ import { getOrCreateSettings } from "@/lib/models/settings";
 import { requireApiUser } from "@/lib/auth/session";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import {
+  normalizeTemplateLanguageCode,
   resolveWhatsAppRuntimeConfig,
   sendTemplateMessage,
   type WhatsAppRuntimeConfig,
@@ -40,7 +41,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "templateName is required" }, { status: 400 });
     }
 
-    const languageCode = String(body.languageCode ?? "en_US").trim() || "en_US";
+    const languageCode = normalizeTemplateLanguageCode(String(body.languageCode ?? "en_US").trim() || "en_US");
     const delayMs = Math.min(Math.max(Number(body.delayMs) || DEFAULT_DELAY_MS, 200), 3000);
     const recordInCrm = body.recordInCrm !== false;
 

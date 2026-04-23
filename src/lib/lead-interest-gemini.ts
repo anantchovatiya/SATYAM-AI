@@ -1,11 +1,6 @@
 import type { Db } from "mongodb";
 import type { ObjectId } from "mongodb";
-import {
-  applyAgentFulfillmentFloor,
-  geminiInterestScoreFromMessages,
-  getLastMessagesForInterestScore,
-  type IncomingMessage,
-} from "@/lib/ai";
+import { resolveGeminiLeadScoreLast5, type IncomingMessage } from "@/lib/ai";
 import { clampAiInterestScore0to100 } from "@/lib/interest-score";
 import { leadsCollection } from "@/lib/models/lead";
 import { getOrCreateSettings } from "@/lib/models/settings";
@@ -14,7 +9,7 @@ import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { canonicalWaContactKey, mongoMatchStoredWaFromForUser } from "@/lib/wa-phone";
 
 /**
- * Recompute `interestScore` / Hot–New–Silent from Gemini on the last 5 messages, then persist.
+ * Recompute `interestScore` / Hot–New–Silent from Gemini on the last N thread messages, then persist.
  * Uses the same `from` matching as the rest of WhatsApp storage (canonical + variants).
  */
 export async function refreshLeadInterestScoreFromWaThread(
@@ -32,7 +27,7 @@ export async function refreshLeadInterestScoreFromWaThread(
   const recent = await messagesCol
     .find(mongoMatchStoredWaFromForUser(userId, canon))
     .sort({ timestamp: -1 })
-    .limit(20)
+    .limit(30)
     .toArray();
   if (recent.length === 0) return;
 
@@ -44,11 +39,7 @@ export async function refreshLeadInterestScoreFromWaThread(
       timestamp: m.timestamp.toISOString(),
     }));
 
-  const window = getLastMessagesForInterestScore(ctx);
-  const slice = window.length ? window : ctx;
-  const gem = await geminiInterestScoreFromMessages(slice);
-  let interestScore = clampAiInterestScore0to100(gem?.leadScore ?? 35);
-  interestScore = applyAgentFulfillmentFloor(slice, interestScore);
+  const interestScore = clampAiInterestScore0to100(await resolveGeminiLeadScoreLast5(ctx));
   const status = interestScore >= 75 ? "Hot" : interestScore >= 35 ? "New" : "Silent";
 
   const lead = await leadsCol.findOne({ userId, phone: leadDisplayPhone });

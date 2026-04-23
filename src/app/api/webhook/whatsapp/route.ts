@@ -322,7 +322,7 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
       )
     )
     .sort({ timestamp: -1 })
-    .limit(20)
+    .limit(30)
     .toArray();
 
   const contextMessages = recentMessages

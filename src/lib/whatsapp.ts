@@ -115,6 +115,71 @@ export async function sendTextMessage(
 
 // ── Send a template message (e.g. business card / greeting) ──────────────────
 
+type GraphErrorBody = {
+  message?: string;
+  type?: string;
+  code?: number;
+  error_subcode?: number;
+  error_data?: { details?: string };
+  is_transient?: boolean;
+  fbtrace_id?: string;
+};
+
+/**
+ * Every body variable must be an object like `{ "type": "text", "text": "…" }`.
+ * Users sometimes paste `{ "text": "…" }` only — Meta returns (#132012) if `type` is missing.
+ */
+export function normalizeTemplateComponents(components: unknown): unknown[] {
+  if (!Array.isArray(components)) return [];
+  return components.map((comp) => {
+    if (!comp || typeof comp !== "object") return comp;
+    const c = comp as Record<string, unknown>;
+    if (!Array.isArray(c.parameters)) return comp;
+    const parameters = c.parameters.map((p) => {
+      if (!p || typeof p !== "object") return p;
+      const param = p as Record<string, unknown>;
+      if (typeof param.type === "string" && param.type.length > 0) return p;
+      if (param.image && typeof param.image === "object") {
+        return { type: "image", image: param.image };
+      }
+      if (typeof param.text === "string") {
+        const o: Record<string, unknown> = { type: "text", text: param.text };
+        if (typeof param.parameter_name === "string") o.parameter_name = param.parameter_name;
+        return o;
+      }
+      return p;
+    });
+    return { ...c, parameters };
+  });
+}
+
+/** Short follow-up to Meta’s message (avoid duplicating the same paragraph the API already sent). */
+export function formatWhatsAppTemplateSendError(err: GraphErrorBody | undefined): string {
+  const base = (err?.message ?? "WhatsApp send failed").trim();
+  const sub = err?.error_subcode;
+  const is132012 =
+    sub === 132012 ||
+    (typeof base === "string" && (base.includes("132012") || /parameter format does not match/i.test(base)));
+  const is132000 =
+    sub === 132000 || (typeof base === "string" && (base.includes("132000") || /parameters.*match/i.test(base)));
+
+  const hint = is132012
+    ? " Fix: in Bulk messages use “Load from Meta” (requires WHATSAPP_WABA_ID) or count header/body/button variables and match language code exactly to the template in Manager."
+    : is132000
+      ? " Fix: match parameter count and language (e.g. en_US) to the template."
+      : "";
+  return hint ? `${base} —${hint}` : base;
+}
+
+/**
+ * `language_code` in Meta is usually `en_US` (underscore). `en-US` is rejected.
+ */
+export function normalizeTemplateLanguageCode(code: string): string {
+  const t = String(code).trim();
+  if (!t) return "en_US";
+  return t.replace(/-/g, "_");
+}
+
 export async function sendTemplateMessage(
   to: string,
   templateName: string,
@@ -123,6 +188,8 @@ export async function sendTemplateMessage(
   config?: WhatsAppRuntimeConfig
 ): Promise<WaSendResult> {
   const { token, phoneNumberId, dryRun } = getConfig(config);
+  const lang = normalizeTemplateLanguageCode(languageCode);
+  const normalized = normalizeTemplateComponents(components);
 
   if (dryRun) {
     console.log(`[WhatsApp DRY-RUN] Template "${templateName}" → ${to}`);
@@ -135,6 +202,19 @@ export async function sendTemplateMessage(
   }
 
   try {
+    // Meta: if the template has no variables, omit `components` (empty array can confuse validation).
+    const templatePayload: {
+      name: string;
+      language: { code: string };
+      components?: unknown[];
+    } = {
+      name: templateName,
+      language: { code: lang },
+    };
+    if (normalized.length > 0) {
+      templatePayload.components = normalized;
+    }
+
     const res = await fetch(`${BASE_URL}/${phoneNumberId}/messages`, {
       method: "POST",
       headers: {
@@ -144,15 +224,22 @@ export async function sendTemplateMessage(
       body: JSON.stringify({
         messaging_product: "whatsapp",
         to: toDigits,
-        type:     "template",
-        template: { name: templateName, language: { code: languageCode }, components },
+        type: "template",
+        template: templatePayload,
       }),
     });
 
-    const json = await res.json() as { messages?: { id: string }[]; error?: { message: string } };
+    const json = (await res.json()) as {
+      messages?: { id: string }[];
+      error?: GraphErrorBody;
+    };
 
     if (!res.ok || json.error) {
-      return { ok: false, error: json.error?.message ?? `HTTP ${res.status}`, mode: "live" };
+      return {
+        ok: false,
+        error: formatWhatsAppTemplateSendError(json.error),
+        mode: "live",
+      };
     }
 
     return { ok: true, messageId: json.messages?.[0]?.id ?? "unknown", mode: "live" };

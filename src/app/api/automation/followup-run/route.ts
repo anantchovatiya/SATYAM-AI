@@ -6,7 +6,6 @@ import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { followupsCollection } from "@/lib/models/followup";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { generateFollowUp } from "@/lib/ai";
-import { hasSensitiveTopic } from "@/lib/conversation-status";
 import {
   resolveWhatsAppRuntimeConfig,
   sendTextMessage,
@@ -56,7 +55,6 @@ export async function GET(req: NextRequest) {
     );
   }
 }
-
 async function runFollowupAutomation(options: RunOptions, userId: ObjectId) {
   const userIdHex = userId.toHexString();
   const db = await getDb();
@@ -158,38 +156,7 @@ async function runFollowupAutomation(options: RunOptions, userId: ObjectId) {
       continue;
     }
 
-    const sensitive = hasSensitiveTopic(inDoc.text, settings.humanHandoverKeywords);
-    if (sensitive) {
-      escalated += 1;
-      if (!options.dryRun) {
-        await leadsCol.updateOne(
-          { _id: lead._id },
-          {
-            $set: {
-              needsHuman: true,
-              conversationStatus: "escalated",
-              updatedAt: now,
-            },
-          }
-        );
-        await followupsCol.insertOne({
-          userId,
-          leadId,
-          leadName: lead.name,
-          phone: lead.phone,
-          task: "Auto follow-up blocked: human escalation",
-          dueDate: now,
-          owner: lead.assignedTo || "Unassigned",
-          status: "Pending",
-          notes: `Sensitive topic in latest message: "${inDoc.text.slice(0, 140)}"`,
-          createdAt: now,
-          updatedAt: now,
-        });
-        await clearAutoFollowupQueueTask(db, userId, leadId);
-      }
-      details.push({ leadId, name: lead.name, action: "escalate", reason: "Sensitive topic detected" });
-      continue;
-    }
+    // Auto follow-up is allowed even if the last inbound matches handover keywords — nudges are intentional.
 
     const follow = await generateFollowUp({
       leadId,
@@ -367,3 +334,4 @@ function coerceCompleteReply(reply: string, leadName: string): string {
 
   return compact;
 }
+

@@ -343,7 +343,8 @@ export function AutomationClient({
               Human Handover Keywords
             </label>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              When any of these words are detected, the conversation is flagged for a human agent.
+              Used for live replies and flags — when a customer message contains any of these, routing may request a human.
+              Queued <span className="font-medium">auto follow-up</span> nudges are still sent (they do not use this block).
             </p>
             <KeywordInput
               keywords={form.humanHandoverKeywords}

@@ -15,16 +15,28 @@ type BulkResult = {
   results?: { to: string; ok: boolean; messageId?: string; error?: string }[];
 };
 
-const COMPONENTS_PLACEHOLDER = `[]
+const COMPONENTS_PLACEHOLDER = `[]   ← no variables in template
 
-Or with body variables (example — match your template in Meta):
+Body only ({{1}}):
 [
   {
     "type": "body",
     "parameters": [
-      { "type": "text", "text": "Customer name" }
+      { "type": "text", "text": "First value for {{1}}" }
     ]
   }
+]
+
++ dynamic IMAGE header (URL must be https, public):
+[
+  { "type": "header", "parameters": [ { "type": "image", "image": { "link": "https://…/x.jpg" } } ] },
+  { "type": "body", "parameters": [ { "type": "text", "text": "…" } ] }
+]
+
++ URL button variable (index 0 = first button; match Manager):
+[
+  { "type": "body", "parameters": [ { "type": "text", "text": "Name" } ] },
+  { "type": "button", "sub_type": "url", "index": "0", "parameters": [ { "type": "text", "text": "path-suffix" } ] }
 ]`;
 
 type Mode = "templates" | "qr";
@@ -43,13 +55,56 @@ export function BulkMessagesClient() {
   const [recipients, setRecipients] = useState("");
   const [delayMs, setDelayMs] = useState(500);
   const [loading, setLoading] = useState(false);
+  const [loadingScaffold, setLoadingScaffold] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [result, setResult] = useState<BulkResult | null>(null);
   const [formError, setFormError] = useState("");
+  const [scaffoldInfo, setScaffoldInfo] = useState<string | null>(null);
 
   const [qrMessage, setQrMessage] = useState(QR_PLACEHOLDER_HELP);
   const [qrRecipients, setQrRecipients] = useState("");
   const [qrImageDataUrl, setQrImageDataUrl] = useState<string | null>(null);
+
+  const loadTemplateScaffold = useCallback(async () => {
+    const name = templateName.trim();
+    if (!name) {
+      setFormError("Enter the template name first (as in WhatsApp Manager).");
+      return;
+    }
+    setLoadingScaffold(true);
+    setFormError("");
+    setScaffoldInfo(null);
+    try {
+      const q = new URLSearchParams({
+        templateName: name,
+        languageCode: languageCode.trim() || "en_US",
+      });
+      const res = await fetch(`/api/whatsapp/template-scaffold?${q.toString()}`);
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        components?: unknown[];
+        notes?: string[];
+        language?: string;
+      };
+      if (!res.ok) {
+        setFormError(data.error ?? "Could not load template");
+        return;
+      }
+      if (data.components) {
+        setComponentsJson(JSON.stringify(data.components, null, 2));
+      }
+      setScaffoldInfo(
+        [data.notes?.length ? data.notes.map((n) => `• ${n}`).join("\n") : "Components filled from Meta.", `Language: ${data.language ?? "—"}`]
+          .filter(Boolean)
+          .join("\n")
+      );
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setLoadingScaffold(false);
+    }
+  }, [templateName, languageCode]);
 
   const fillFromLeads = useCallback(async () => {
     setLoadingLeads(true);
@@ -168,10 +223,22 @@ export function BulkMessagesClient() {
     e.preventDefault();
     setLoading(true);
     setFormError("");
+    setScaffoldInfo(null);
     setResult(null);
     try {
-      let components: unknown = componentsJson.trim();
-      if (components === "") components = "[]";
+      const raw = componentsJson.trim() || "[]";
+      let components: unknown[] = [];
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (!Array.isArray(parsed)) {
+          setFormError("Template components must be a JSON array (e.g. [] or [ { type: body, … } ]).");
+          return;
+        }
+        components = parsed;
+      } catch {
+        setFormError("Template components: invalid JSON. Fix the textarea or use [] for templates with no variables.");
+        return;
+      }
       const res = await fetch("/api/whatsapp/bulk-template", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -270,8 +337,20 @@ export function BulkMessagesClient() {
           <ul className="mt-2 list-inside list-disc space-y-1 text-amber-800/90 dark:text-amber-200/90">
             <li>Use the <strong>exact template name</strong> as in WhatsApp Manager (approved / active).</li>
             <li>
-              If the template has variables, paste a valid <code className="rounded bg-amber-100/80 px-1 dark:bg-amber-900/50">components</code>{" "}
-              JSON array (see placeholder below).
+              <strong>Language</strong> must match the template (e.g. <code className="rounded bg-amber-100/80 px-1">en_US</code>,{" "}
+              <code className="rounded bg-amber-100/80 px-1">en</code>) — use underscore, not a hyphen.
+            </li>
+            <li>
+              Error <code className="rounded bg-amber-100/80 px-1">#132012</code>: use{" "}
+              <strong>Load from Meta</strong> below (set <code className="rounded bg-amber-100/80 px-1">WHATSAPP_WABA_ID</code> in
+              env) to fill <code className="rounded bg-amber-100/80 px-1">components</code> automatically, then replace
+              placeholder text/URLs and send.
+            </li>
+            <li>
+              If the template has variables, paste a valid <code className="rounded bg-amber-100/80 px-1">components</code>{" "}
+              JSON array (see placeholder in the field below). Each body variable must include{" "}
+              <code className="rounded bg-amber-100/80 px-1">{`"type": "text"`}</code> and{" "}
+              <code className="rounded bg-amber-100/80 px-1">{`"text": "…"`}</code>.
             </li>
             <li>Max <strong>100</strong> numbers per batch to stay within server time limits — run again for more.</li>
           </ul>
@@ -323,6 +402,26 @@ export function BulkMessagesClient() {
               className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-primary dark:border-slate-700 dark:bg-slate-950"
             />
           </label>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={loadingScaffold}
+              onClick={() => void loadTemplateScaffold()}
+              className="inline-flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-sm font-medium text-primary hover:bg-primary/15 disabled:opacity-50 dark:bg-primary/20"
+            >
+              {loadingScaffold ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              Load from Meta
+            </button>
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              Fetches the approved template and fills the JSON (needs <code className="font-mono">WHATSAPP_WABA_ID</code>).
+            </span>
+          </div>
+          {scaffoldInfo && (
+            <pre className="whitespace-pre-wrap rounded-lg border border-emerald-200/80 bg-emerald-50/80 px-3 py-2 text-xs text-emerald-950 dark:border-emerald-900/50 dark:bg-emerald-950/20 dark:text-emerald-100">
+              {scaffoldInfo}
+            </pre>
+          )}
 
           <label className="block text-sm">
             <span className="text-slate-600 dark:text-slate-400">Template components (JSON)</span>
