@@ -46,7 +46,7 @@ export function followupsCollection(db: Db): Collection<FollowupDoc> {
 }
 
 export function followupDocToRow(doc: FollowupDoc): FollowupRow {
-  const { _id, userId: _u, createdAt, updatedAt, dueDate, ...fields } = doc;
+  const { _id, createdAt, updatedAt, dueDate } = doc;
   const now = new Date();
   const due = new Date(dueDate);
   const diffDays = followupCalendarDiffDays(due, now);
@@ -60,8 +60,14 @@ export function followupDocToRow(doc: FollowupDoc): FollowupRow {
   return {
     id: _id!.toHexString(),
     dueDateStr,
-    ...fields,
+    leadId: doc.leadId,
+    leadName: doc.leadName,
+    phone: doc.phone,
+    task: doc.task,
     dueDate: new Date(dueDate).toISOString(),
+    owner: doc.owner,
+    status: doc.status,
+    notes: doc.notes,
     createdAt: new Date(createdAt).toISOString(),
     updatedAt: new Date(updatedAt).toISOString(),
   };

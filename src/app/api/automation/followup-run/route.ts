@@ -73,7 +73,7 @@ async function runFollowupAutomation(options: RunOptions, userId: ObjectId) {
     .toArray();
 
   let sent = 0;
-  let escalated = 0;
+  const escalated = 0;
   let skipped = 0;
   const details: Array<{ leadId: string; name: string; action: string; reason: string }> = [];
 
