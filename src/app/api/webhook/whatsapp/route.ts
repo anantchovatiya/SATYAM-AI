@@ -27,6 +27,7 @@ import {
   getOrCreateSettings,
   findSettingsByPhoneNumberId,
   findSettingsByVerifyToken,
+  settingsCollection,
 } from "@/lib/models/settings";
 import { usersCollection } from "@/lib/models/user";
 import { ensureTenantIndexes } from "@/lib/models/tenant-indexes";
@@ -41,6 +42,7 @@ import {
   parseWebhookPayload,
   resolveWhatsAppRuntimeConfig,
   sendTextMessage,
+  sendCataloguePdfDocument,
   markAsRead,
   type ParsedWaMessage,
   type WhatsAppRuntimeConfig,
@@ -50,7 +52,7 @@ import { clampAiInterestScore0to100 } from "@/lib/interest-score";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
-import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
+import { getQrSnapshot, sendQrTextMessage, sendQrCatalogue } from "@/lib/whatsapp-qr-connector";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
 import {
   findLeadByCanonicalPhone,
@@ -108,14 +110,18 @@ function countWebhookIncomingMessages(body: unknown): number {
 }
 
 async function resolveOwnerUserIdForInbound(db: Db, msg: ParsedWaMessage): Promise<ObjectId | null> {
-  const doc = await findSettingsByPhoneNumberId(db, msg.phoneNumberId);
+  const pid = msg.phoneNumberId.trim();
+  if (!pid) return null;
+
+  const doc = await findSettingsByPhoneNumberId(db, pid);
   if (doc?.userId) return doc.userId;
-  if (
-    process.env.WHATSAPP_PHONE_NUMBER_ID &&
-    process.env.WHATSAPP_PHONE_NUMBER_ID === msg.phoneNumberId
-  ) {
+
+  const envPhone = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim();
+  if (envPhone && envPhone === pid) {
     const u = await usersCollection(db).findOne({});
-    return u?._id ?? null;
+    if (u?._id) return u._id;
+    const settingsRow = await settingsCollection(db).findOne({ userId: { $exists: true } });
+    return settingsRow?.userId ?? null;
   }
   return null;
 }
@@ -521,6 +527,56 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     },
     { upsert: true }
   ).catch(() => {});
+
+  // ── 12b. Catalogue PDF after AI text (Cloud: media upload + document; QR: Baileys) ──
+  if (replyResult.sharedCatalogue && settings.autoShareCatalogue) {
+    const catalogueMarker = "[AgriBird Catalogue PDF]";
+    const alreadySentPdf = await messagesCol.findOne({
+      userId: ownerUserId,
+      from: msg.from,
+      direction: "out",
+      text: catalogueMarker,
+    });
+    if (!alreadySentPdf) {
+      let pdfMessageId: string | null = null;
+      let pdfPhoneId = msg.phoneNumberId;
+      if (sendChannel === "cloud" && cloudConfigured && waConfig) {
+        const cat = await sendCataloguePdfDocument(msg.from, waConfig);
+        if (cat.ok && cat.mode === "live") {
+          pdfMessageId = cat.messageId;
+          pdfPhoneId = waConfig.phoneNumberId ?? msg.phoneNumberId;
+        } else if (!cat.ok) {
+          console.warn("[webhook] Cloud API catalogue PDF failed:", cat.error);
+        }
+      } else if (sendChannel === "qr") {
+        const cat = await sendQrCatalogue(ownerHex, msg.from);
+        if (cat.ok) {
+          pdfMessageId = cat.messageId;
+          pdfPhoneId = "qr-linked";
+        } else {
+          console.warn("[webhook] QR catalogue PDF failed:", cat.error);
+        }
+      }
+      if (pdfMessageId) {
+        await messagesCol.updateOne(
+          { userId: ownerUserId, waMessageId: pdfMessageId },
+          {
+            $setOnInsert: {
+              userId: ownerUserId,
+              waMessageId: pdfMessageId,
+              from: msg.from,
+              senderName: "SATYAM AI",
+              text: catalogueMarker,
+              timestamp: new Date(),
+              direction: "out",
+              phoneNumberId: pdfPhoneId,
+            },
+          },
+          { upsert: true }
+        ).catch(() => {});
+      }
+    }
+  }
 
   // Update lead's lastFollowup
     await leadsCol.updateOne(

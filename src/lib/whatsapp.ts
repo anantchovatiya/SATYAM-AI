@@ -9,11 +9,17 @@
  *   messages are logged but NOT sent to WhatsApp.
  */
 
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import type { AutomationSettings } from "@/lib/models/settings";
 import { canonicalWaContactKey } from "@/lib/wa-phone";
 
 const GRAPH_API_VERSION = "v22.0";
 const BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
+
+/** Same file as QR document send — must exist under `public/` for Cloud uploads. */
+const CATALOGUE_PDF_REL = ["public", "AgriBird Brochure.pdf"] as const;
+export const CATALOGUE_PDF_FILE_NAME = "AgriBird Brochure.pdf";
 
 export type WaSendResult =
   | { ok: true;  messageId: string; mode: "live" | "dry-run" }
@@ -111,6 +117,105 @@ export async function sendTextMessage(
       mode: "live",
     };
   }
+}
+
+async function uploadWhatsAppMediaPdf(
+  pdfBuffer: Buffer,
+  token: string,
+  phoneNumberId: string
+): Promise<{ id: string } | { error: string }> {
+  const ab = pdfBuffer.buffer.slice(
+    pdfBuffer.byteOffset,
+    pdfBuffer.byteOffset + pdfBuffer.byteLength
+  ) as ArrayBuffer;
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("file", new Blob([ab], { type: "application/pdf" }), CATALOGUE_PDF_FILE_NAME);
+
+  const res = await fetch(`${BASE_URL}/${phoneNumberId}/media`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  const json = (await res.json()) as { id?: string; error?: { message: string } };
+  if (!res.ok || json.error) {
+    return { error: json.error?.message ?? `HTTP ${res.status}` };
+  }
+  if (!json.id?.trim()) return { error: "Media upload returned no id" };
+  return { id: json.id };
+}
+
+async function sendWhatsAppDocumentByMediaId(
+  to: string,
+  mediaId: string,
+  filename: string,
+  token: string,
+  phoneNumberId: string
+): Promise<WaSendResult> {
+  const toDigits = normalizeWhatsAppRecipientId(to);
+  if (!toDigits) {
+    return { ok: false, error: "Invalid recipient: country code + number (digits only).", mode: "live" };
+  }
+  try {
+    const res = await fetch(`${BASE_URL}/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: toDigits,
+        type: "document",
+        document: { id: mediaId, filename },
+      }),
+    });
+    const json = (await res.json()) as { messages?: { id: string }[]; error?: { message: string } };
+    if (!res.ok || json.error) {
+      return { ok: false, error: json.error?.message ?? `HTTP ${res.status}`, mode: "live" };
+    }
+    return { ok: true, messageId: json.messages?.[0]?.id ?? "unknown", mode: "live" };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      mode: "live",
+    };
+  }
+}
+
+/**
+ * Send the AgriBird catalogue PDF as a WhatsApp document (Cloud API).
+ * Uploads the file to Meta media, then sends `type: document` to the recipient.
+ */
+export async function sendCataloguePdfDocument(
+  to: string,
+  config?: WhatsAppRuntimeConfig
+): Promise<WaSendResult> {
+  const { token, phoneNumberId, dryRun } = getConfig(config);
+
+  if (dryRun) {
+    console.log(
+      `[WhatsApp DRY-RUN] catalogue PDF → ${to}\n` +
+        `Set WHATSAPP_TOKEN + WHATSAPP_PHONE_NUMBER_ID to send for real.`
+    );
+    return { ok: true, messageId: `dry-run-pdf-${Date.now()}`, mode: "dry-run" };
+  }
+
+  const pdfPath = path.join(process.cwd(), ...CATALOGUE_PDF_REL);
+  let buffer: Buffer;
+  try {
+    buffer = await readFile(pdfPath);
+  } catch {
+    return { ok: false, error: "Catalogue PDF not found in public folder", mode: "live" };
+  }
+
+  const upload = await uploadWhatsAppMediaPdf(buffer, token!, phoneNumberId!);
+  if ("error" in upload) {
+    return { ok: false, error: upload.error, mode: "live" };
+  }
+  return sendWhatsAppDocumentByMediaId(to, upload.id, CATALOGUE_PDF_FILE_NAME, token!, phoneNumberId!);
 }
 
 // ── Send a template message (e.g. business card / greeting) ──────────────────
@@ -389,7 +494,7 @@ export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
         if (change.field !== "messages") continue;
 
         const { value } = change;
-        const phoneNumberId = value.metadata?.phone_number_id ?? "";
+        const phoneNumberId = (value.metadata?.phone_number_id ?? "").trim();
 
         for (const raw of value.messages ?? []) {
           const msg = raw as WebhookMessage;

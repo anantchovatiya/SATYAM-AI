@@ -440,7 +440,7 @@ export function AutomationClient({
                 <code className="rounded bg-blue-100 px-1 py-0.5 font-mono text-[11px] dark:bg-blue-900/50">
                   public/AgriBird Brochure.pdf
                 </code>
-                {" "}— sent directly as a WhatsApp document (QR connection). To replace it, drop a new PDF in the{" "}
+                {" "}— sent as a WhatsApp document (Cloud API or QR). To replace it, drop a new PDF in the{" "}
                 <code className="rounded bg-blue-100 px-1 py-0.5 font-mono text-[11px] dark:bg-blue-900/50">
                   public/
                 </code>

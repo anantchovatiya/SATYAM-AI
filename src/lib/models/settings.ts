@@ -98,8 +98,9 @@ export async function findSettingsByPhoneNumberId(
   db: Db,
   phoneNumberId: string
 ): Promise<AutomationSettings | null> {
-  if (!phoneNumberId) return null;
-  return settingsCollection(db).findOne({ "whatsapp.phoneNumberId": phoneNumberId });
+  const pid = phoneNumberId.trim();
+  if (!pid) return null;
+  return settingsCollection(db).findOne({ "whatsapp.phoneNumberId": pid });
 }
 
 export async function findSettingsByVerifyToken(db: Db, token: string): Promise<AutomationSettings | null> {
