@@ -32,6 +32,10 @@ export interface WaMessage {
   timestamp: Date;
   direction: "in" | "out";
   phoneNumberId: string; // receiving WA Business phone number ID
+  /** Cloud API inbound media — use Graph `GET /{media-id}` then download URL (Bearer). */
+  mediaKind?: "image" | "video" | "document" | "sticker" | "audio";
+  mediaWaId?: string;
+  mediaMime?: string;
 }
 
 // ── Webhook log document ──────────────────────────────────────────────────────

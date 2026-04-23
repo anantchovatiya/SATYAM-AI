@@ -270,6 +270,9 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
         timestamp:     msg.timestamp,
         direction:     "in",
         phoneNumberId: msg.phoneNumberId,
+        ...(msg.mediaKind ? { mediaKind: msg.mediaKind } : {}),
+        ...(msg.mediaWaId ? { mediaWaId: msg.mediaWaId } : {}),
+        ...(msg.mediaMime ? { mediaMime: msg.mediaMime } : {}),
       },
     },
     { upsert: true }

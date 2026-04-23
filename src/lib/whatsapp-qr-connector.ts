@@ -158,6 +158,23 @@ function isImageMessage(message: unknown): boolean {
   return Boolean(m?.imageMessage);
 }
 
+/** Plain media without caption/text — still persist a thread line so inbox shows something. */
+function inferMediaPlaceholder(message: unknown): string | null {
+  const m = message as {
+    imageMessage?: unknown;
+    videoMessage?: unknown;
+    documentMessage?: unknown;
+    stickerMessage?: unknown;
+    audioMessage?: unknown;
+  };
+  if (m?.imageMessage) return "[Image]";
+  if (m?.videoMessage) return "[Video]";
+  if (m?.documentMessage) return "[Document]";
+  if (m?.stickerMessage) return "[Sticker]";
+  if (m?.audioMessage) return "[Voice message]";
+  return null;
+}
+
 async function processBusinessCardImage(args: {
   userId: ObjectId;
   userIdHex: string;
@@ -383,7 +400,10 @@ async function persistBaileysMessage(
   const phone = extractPhoneFromJid(msg.key?.remoteJid);
   if (!phone) return;
 
-  const text = extractText(msg.message);
+  let text = extractText(msg.message);
+  if (!text) {
+    text = inferMediaPlaceholder(msg.message) ?? "";
+  }
   if (!text) return;
 
   const waMessageId = msg.key?.id ?? `qr-${Date.now()}-${Math.random()}`;
@@ -903,8 +923,14 @@ export async function startQrConnection(userIdHex: string, forceRestart = false)
           const from = extractPhoneFromJid(jid);
           if (!from) continue;
 
-          // ── Image: check if it's a business card ──────────────────────────
+          // ── Image: persist to inbox, then optional business-card scan ───────
           if (isImageMessage(msg.message) && isRecentInbound(ts)) {
+            persistBaileysMessage(
+              userId,
+              msg as unknown as Parameters<typeof persistBaileysMessage>[1]
+            ).catch((err) => {
+              console.error("[wa-qr] persist image failed:", err);
+            });
             processBusinessCardImage({
               userId,
               userIdHex,
@@ -1107,6 +1133,37 @@ export async function sendQrCatalogue(
       error: err instanceof Error ? err.message : "Failed to send PDF",
     };
   }
+}
+
+export async function sendQrDocumentBuffer(
+  userIdHex: string,
+  to: string,
+  buffer: Buffer,
+  mimetype: string,
+  fileName: string
+): Promise<{ ok: true; messageId: string } | { ok: false; error: string }> {
+  const store = getStore(userIdHex);
+  if (!store.socket || store.status.state !== "connected") {
+    return { ok: false, error: "QR session is not connected" };
+  }
+
+  const jids = resolveSendJids(to);
+  if (jids.length === 0) return { ok: false, error: "Invalid recipient" };
+
+  let lastError = "Failed to send document";
+  for (const jid of jids) {
+    try {
+      const result = await store.socket.sendMessage(jid, {
+        document: buffer,
+        mimetype,
+        fileName,
+      });
+      return { ok: true, messageId: result?.key?.id ?? `qr-doc-${Date.now()}` };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return { ok: false, error: lastError };
 }
 
 export async function sendQrTextMessage(userIdHex: string, to: string, text: string) {

@@ -145,6 +145,14 @@ function DateSeparator({ date }: { date: string }) {
 // ── Message bubble ─────────────────────────────────────────────────────────────
 function MessageBubble({ msg }: { msg: ChatMessage }) {
   const isOut = msg.direction === "out";
+  const isPlaceholderOnly =
+    Boolean(msg.mediaSrc) &&
+    (msg.text === "[Image]" ||
+      msg.text === "[Video]" ||
+      msg.text === "[Document]" ||
+      msg.text === "[Sticker]" ||
+      msg.text === "[Voice message]");
+
   return (
     <div className={cn("flex items-end gap-2", isOut ? "flex-row-reverse" : "flex-row")}>
       {!isOut && (
@@ -160,7 +168,38 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
             : "rounded-bl-sm bg-white text-slate-800 dark:bg-slate-800 dark:text-slate-100",
         )}
       >
-        <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">{msg.text}</p>
+        {(msg.mediaKind === "image" || msg.mediaKind === "sticker") && msg.mediaSrc && (
+          <>
+            {/* eslint-disable-next-line @next/next/no-img-element -- session-authenticated media URL */}
+            <img
+              src={msg.mediaSrc}
+              alt=""
+              className="mb-2 max-h-56 max-w-full rounded-lg object-contain"
+            />
+          </>
+        )}
+        {msg.mediaKind === "video" && msg.mediaSrc && (
+          <video src={msg.mediaSrc} controls className="mb-2 max-h-56 max-w-full rounded-lg" />
+        )}
+        {msg.mediaKind === "audio" && msg.mediaSrc && (
+          <audio src={msg.mediaSrc} controls className="mb-2 w-full max-w-[260px]" />
+        )}
+        {msg.mediaKind === "document" && msg.mediaSrc && (
+          <a
+            href={msg.mediaSrc}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={cn(
+              "mb-2 inline-block text-sm font-medium underline",
+              isOut ? "text-white/90" : "text-primary",
+            )}
+          >
+            Open document
+          </a>
+        )}
+        {!isPlaceholderOnly && (
+          <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">{msg.text}</p>
+        )}
         <div className={cn("mt-1 flex items-center gap-1", isOut ? "justify-end" : "justify-start")}>
           <span className={cn("text-[10px]", isOut ? "text-primary-foreground/70" : "text-slate-400")}>
             {msg.timestamp}
@@ -189,6 +228,7 @@ export function InboxClient({ initialContacts }: { initialContacts: Contact[] })
   const [sendError, setSendError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<number | null>(null);
   const sendLockRef = useRef(false);
 
@@ -290,6 +330,31 @@ export function InboxClient({ initialContacts }: { initialContacts: Contact[] })
     } finally {
       setSending(false);
       sendLockRef.current = false;
+    }
+  }
+
+  async function sendAttachment(file: File) {
+    if (!active?.phone || sending || sendLockRef.current) return;
+    sendLockRef.current = true;
+    setSending(true);
+    setSendError(null);
+    try {
+      const fd = new FormData();
+      fd.set("to", active.phone);
+      fd.set("file", file);
+      const res = await fetch("/api/inbox/send-media", { method: "POST", body: fd });
+      const data = (await res.json()) as { error?: string; ok?: boolean };
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error ?? "Failed to send attachment.");
+      }
+      await refreshInbox();
+      inputRef.current?.focus();
+    } catch (err) {
+      setSendError(err instanceof Error ? err.message : "Failed to send attachment.");
+    } finally {
+      setSending(false);
+      sendLockRef.current = false;
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
@@ -520,7 +585,23 @@ export function InboxClient({ initialContacts }: { initialContacts: Contact[] })
                   </div>
 
                   {/* Attachment */}
-                  <button className="mt-1 rounded-lg p-1.5 text-slate-400 hover:text-primary transition">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/gif,application/pdf"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void sendAttachment(f);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    title="Send photo or PDF"
+                    disabled={sending || !active}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="mt-1 rounded-lg p-1.5 text-slate-400 transition hover:text-primary disabled:opacity-40"
+                  >
                     <Paperclip className="h-5 w-5" />
                   </button>
 

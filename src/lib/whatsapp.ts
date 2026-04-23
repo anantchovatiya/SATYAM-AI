@@ -119,18 +119,20 @@ export async function sendTextMessage(
   }
 }
 
-async function uploadWhatsAppMediaPdf(
-  pdfBuffer: Buffer,
+async function uploadWhatsAppMedia(
+  fileBuffer: Buffer,
+  mimeType: string,
+  filenameForUpload: string,
   token: string,
   phoneNumberId: string
 ): Promise<{ id: string } | { error: string }> {
-  const ab = pdfBuffer.buffer.slice(
-    pdfBuffer.byteOffset,
-    pdfBuffer.byteOffset + pdfBuffer.byteLength
+  const ab = fileBuffer.buffer.slice(
+    fileBuffer.byteOffset,
+    fileBuffer.byteOffset + fileBuffer.byteLength
   ) as ArrayBuffer;
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
-  form.append("file", new Blob([ab], { type: "application/pdf" }), CATALOGUE_PDF_FILE_NAME);
+  form.append("file", new Blob([ab], { type: mimeType }), filenameForUpload);
 
   const res = await fetch(`${BASE_URL}/${phoneNumberId}/media`, {
     method: "POST",
@@ -143,6 +145,118 @@ async function uploadWhatsAppMediaPdf(
   }
   if (!json.id?.trim()) return { error: "Media upload returned no id" };
   return { id: json.id };
+}
+
+async function sendWhatsAppImageByMediaId(
+  to: string,
+  mediaId: string,
+  token: string,
+  phoneNumberId: string,
+  caption?: string
+): Promise<WaSendResult> {
+  const toDigits = normalizeWhatsAppRecipientId(to);
+  if (!toDigits) {
+    return { ok: false, error: "Invalid recipient: country code + number (digits only).", mode: "live" };
+  }
+  try {
+    const imagePayload: { id: string; caption?: string } = { id: mediaId };
+    if (caption?.trim()) imagePayload.caption = caption.trim().slice(0, 1024);
+    const res = await fetch(`${BASE_URL}/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: toDigits,
+        type: "image",
+        image: imagePayload,
+      }),
+    });
+    const json = (await res.json()) as { messages?: { id: string }[]; error?: { message: string } };
+    if (!res.ok || json.error) {
+      return { ok: false, error: json.error?.message ?? `HTTP ${res.status}`, mode: "live" };
+    }
+    return { ok: true, messageId: json.messages?.[0]?.id ?? "unknown", mode: "live" };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      mode: "live",
+    };
+  }
+}
+
+/** Upload a local image and send it on Cloud API. */
+export async function sendCloudImageFromBuffer(
+  to: string,
+  imageBuffer: Buffer,
+  mimeType: string,
+  filenameForUpload: string,
+  config?: WhatsAppRuntimeConfig
+): Promise<WaSendResult> {
+  const { token, phoneNumberId, dryRun } = getConfig(config);
+  if (dryRun) {
+    console.log(`[WhatsApp DRY-RUN] image → ${to}`);
+    return { ok: true, messageId: `dry-run-img-${Date.now()}`, mode: "dry-run" };
+  }
+  const upload = await uploadWhatsAppMedia(imageBuffer, mimeType, filenameForUpload, token!, phoneNumberId!);
+  if ("error" in upload) return { ok: false, error: upload.error, mode: "live" };
+  return sendWhatsAppImageByMediaId(to, upload.id, token!, phoneNumberId!);
+}
+
+/** Upload a local file and send as a document on Cloud API. */
+export async function sendCloudDocumentFromBuffer(
+  to: string,
+  fileBuffer: Buffer,
+  mimeType: string,
+  filename: string,
+  config?: WhatsAppRuntimeConfig
+): Promise<WaSendResult> {
+  const { token, phoneNumberId, dryRun } = getConfig(config);
+  if (dryRun) {
+    console.log(`[WhatsApp DRY-RUN] document → ${to}`);
+    return { ok: true, messageId: `dry-run-doc-${Date.now()}`, mode: "dry-run" };
+  }
+  const upload = await uploadWhatsAppMedia(fileBuffer, mimeType, filename, token!, phoneNumberId!);
+  if ("error" in upload) return { ok: false, error: upload.error, mode: "live" };
+  return sendWhatsAppDocumentByMediaId(to, upload.id, filename, token!, phoneNumberId!);
+}
+
+/**
+ * Download inbound Cloud API media (two-step: resolve URL, then fetch bytes with Bearer).
+ */
+export async function fetchCloudMediaBinary(
+  mediaWaId: string,
+  config?: WhatsAppRuntimeConfig
+): Promise<{ buffer: Buffer; mimeType: string } | { error: string }> {
+  const token =
+    config?.token?.trim() || process.env.WHATSAPP_TOKEN?.trim() || "";
+  if (!token) return { error: "WhatsApp not configured" };
+
+  try {
+    const metaRes = await fetch(`${BASE_URL}/${mediaWaId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const metaJson = (await metaRes.json()) as {
+      url?: string;
+      mime_type?: string;
+      error?: { message: string };
+    };
+    if (!metaRes.ok || metaJson.error || !metaJson.url) {
+      return { error: metaJson.error?.message ?? `Media meta HTTP ${metaRes.status}` };
+    }
+    const binRes = await fetch(metaJson.url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!binRes.ok) {
+      return { error: `Media download HTTP ${binRes.status}` };
+    }
+    const buf = Buffer.from(await binRes.arrayBuffer());
+    return { buffer: buf, mimeType: metaJson.mime_type ?? "application/octet-stream" };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 async function sendWhatsAppDocumentByMediaId(
@@ -211,7 +325,13 @@ export async function sendCataloguePdfDocument(
     return { ok: false, error: "Catalogue PDF not found in public folder", mode: "live" };
   }
 
-  const upload = await uploadWhatsAppMediaPdf(buffer, token!, phoneNumberId!);
+  const upload = await uploadWhatsAppMedia(
+    buffer,
+    "application/pdf",
+    CATALOGUE_PDF_FILE_NAME,
+    token!,
+    phoneNumberId!
+  );
   if ("error" in upload) {
     return { ok: false, error: upload.error, mode: "live" };
   }
@@ -382,6 +502,9 @@ export interface ParsedWaMessage {
   text:          string;
   timestamp:     Date;
   phoneNumberId: string;
+  mediaKind?:    "image" | "video" | "document" | "sticker" | "audio";
+  mediaWaId?:    string;
+  mediaMime?:    string;
 }
 
 type WebhookMessage = {
@@ -390,12 +513,12 @@ type WebhookMessage = {
   timestamp: string;
   type: string;
   text?: { body?: string };
-  image?: { caption?: string };
-  video?: { caption?: string };
-  audio?: { mime_type?: string };
-  voice?: { mime_type?: string };
-  document?: { caption?: string; filename?: string };
-  sticker?: { mime_type?: string };
+  image?: { id?: string; caption?: string; mime_type?: string };
+  video?: { id?: string; caption?: string; mime_type?: string };
+  audio?: { id?: string; mime_type?: string };
+  voice?: { id?: string; mime_type?: string };
+  document?: { id?: string; caption?: string; filename?: string; mime_type?: string };
+  sticker?: { id?: string; mime_type?: string };
   button?: { text?: string; payload?: string };
   interactive?: {
     type?: string;
@@ -469,6 +592,32 @@ export function extractInboundTextFromWebhookMessage(msg: WebhookMessage): strin
   }
 }
 
+function inboundMediaFromWebhookMessage(msg: WebhookMessage): Pick<
+  ParsedWaMessage,
+  "mediaKind" | "mediaWaId" | "mediaMime"
+> {
+  const t = msg.type;
+  if (t === "image" && msg.image?.id) {
+    return { mediaKind: "image", mediaWaId: msg.image.id, mediaMime: msg.image.mime_type };
+  }
+  if (t === "video" && msg.video?.id) {
+    return { mediaKind: "video", mediaWaId: msg.video.id, mediaMime: msg.video.mime_type };
+  }
+  if (t === "document" && msg.document?.id) {
+    return { mediaKind: "document", mediaWaId: msg.document.id, mediaMime: msg.document.mime_type };
+  }
+  if (t === "sticker" && msg.sticker?.id) {
+    return { mediaKind: "sticker", mediaWaId: msg.sticker.id, mediaMime: msg.sticker.mime_type };
+  }
+  if (t === "audio" && msg.audio?.id) {
+    return { mediaKind: "audio", mediaWaId: msg.audio.id, mediaMime: msg.audio.mime_type };
+  }
+  if (t === "voice" && msg.voice?.id) {
+    return { mediaKind: "audio", mediaWaId: msg.voice.id, mediaMime: msg.voice.mime_type };
+  }
+  return {};
+}
+
 export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
   const results: ParsedWaMessage[] = [];
 
@@ -508,6 +657,8 @@ export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
           const fromCanon = canonicalWaContactKey(msg.from);
           if (!fromCanon) continue;
 
+          const media = inboundMediaFromWebhookMessage(msg);
+
           results.push({
             waMessageId: msg.id,
             from: fromCanon,
@@ -515,6 +666,7 @@ export function parseWebhookPayload(body: unknown): ParsedWaMessage[] {
             text,
             timestamp: new Date(Number(msg.timestamp) * 1000),
             phoneNumberId,
+            ...media,
           });
         }
       }

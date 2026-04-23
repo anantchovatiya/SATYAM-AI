@@ -13,6 +13,9 @@ export interface ChatMessage {
   date:       string;   // "Today" | "Yesterday" | "Apr 14"
   status?:    MessageStatus;
   channel?:   MessageChannel;  // "api" = Cloud/Meta, "qr" = QR/Baileys
+  /** Cloud API: session-authenticated proxy URL to load media binary */
+  mediaKind?: "image" | "video" | "document" | "sticker" | "audio";
+  mediaSrc?:  string;
 }
 
 export interface ChatNote {

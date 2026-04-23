@@ -64,6 +64,15 @@ export async function getInboxContacts(userId: ObjectId, limitMessages = 1500): 
     const channel: MessageChannel =
       m.phoneNumberId === "qr-linked" ? "qr" : "api";
 
+    const hasCloudInboundMedia =
+      m.direction === "in" &&
+      Boolean(m.mediaWaId && m.mediaKind) &&
+      m.phoneNumberId !== "qr-linked";
+
+    const mediaSrc = hasCloudInboundMedia
+      ? `/api/inbox/media?waMessageId=${encodeURIComponent(m.waMessageId)}`
+      : undefined;
+
     msgByPhone[key].push({
       id: m.waMessageId,
       text: m.text,
@@ -72,6 +81,8 @@ export async function getInboxContacts(userId: ObjectId, limitMessages = 1500): 
       date: dateStr,
       status: m.direction === "out" ? "delivered" : undefined,
       channel,
+      ...(m.mediaKind ? { mediaKind: m.mediaKind } : {}),
+      ...(mediaSrc ? { mediaSrc } : {}),
     });
   }
 
