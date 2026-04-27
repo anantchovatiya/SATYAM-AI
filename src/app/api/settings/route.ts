@@ -58,9 +58,9 @@ export async function PUT(req: NextRequest) {
       catalogueLink: String(body.catalogueLink ?? ""),
       greetingTemplate: String(body.greetingTemplate ?? ""),
       followUpTemplate: String(body.followUpTemplate ?? ""),
-      aiTone: (["friendly", "professional", "premium"].includes(body.aiTone as string)
+      aiTone: (["sales", "friendly", "professional", "premium"].includes(body.aiTone as string)
         ? body.aiTone
-        : "friendly") as AutomationSettings["aiTone"],
+        : "sales") as AutomationSettings["aiTone"],
       updatedAt: new Date(),
     };
 

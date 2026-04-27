@@ -1,7 +1,9 @@
 import { ObjectId, type Collection, type Db } from "mongodb";
 import { normalizeAutoReplyExcludedPhones } from "@/lib/auto-reply-exclusions";
 
-export type AiTone = "friendly" | "professional" | "premium";
+export type AiTone = "sales" | "friendly" | "professional" | "premium";
+
+const AI_TONE_SET = new Set<string>(["sales", "friendly", "professional", "premium"]);
 
 export interface WhatsAppConnectionSettings {
   token: string;
@@ -58,7 +60,8 @@ export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id" | "userId"> = {
   followUpDelayDays: 2,
   followUpMinInterestScore: 0,
   humanHandoverKeywords: ["price", "discount", "urgent", "complaint"],
-  languageMirrorMode: true,
+  /** When true, match the lead's message language. When false, default to Hinglish (Hindi in Roman/English script). */
+  languageMirrorMode: false,
   businessCardAutoSend: false,
   restrictToKnowledgeBase: false,
   autoShareCatalogue: true,
@@ -66,10 +69,10 @@ export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id" | "userId"> = {
   productCatalogueInformation: "",
   catalogueLink: "",
   greetingTemplate:
-    "Hi {{name}}! 👋 Thanks for reaching out to SATYAM AI.\nHow can we help you today?",
+    "Hi Sir! 👋 Thanks for connecting with us.\nBataiye kaun sa product / quantity dekh rahe ho — main help kar dunga.",
   followUpTemplate:
-    "Hey {{name}}, just checking in! 😊\nHave you had a chance to review our proposal?\nWe're here if you have any questions.",
-  aiTone: "friendly",
+    "Hello Sir! 😊 Just following up — kya aapne proposal dekh liya?\nAgar koi sawaal ho to bataiye, main yahin hoon.",
+  aiTone: "sales",
   updatedAt: new Date(),
 };
 
@@ -102,6 +105,14 @@ export async function getOrCreateSettings(db: Db, userId: ObjectId): Promise<Aut
       autoReplyExcludedPhones: normalizeAutoReplyExcludedPhones(doc.autoReplyExcludedPhones),
       followUpMinInterestScore:
         typeof doc.followUpMinInterestScore === "number" ? doc.followUpMinInterestScore : DEFAULT_SETTINGS.followUpMinInterestScore,
+      aiTone:
+        typeof doc.aiTone === "string" && AI_TONE_SET.has(doc.aiTone)
+          ? (doc.aiTone as AiTone)
+          : DEFAULT_SETTINGS.aiTone,
+      languageMirrorMode:
+        typeof doc.languageMirrorMode === "boolean"
+          ? doc.languageMirrorMode
+          : DEFAULT_SETTINGS.languageMirrorMode,
     };
   }
 

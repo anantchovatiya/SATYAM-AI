@@ -183,6 +183,8 @@ function parseJsonFromText(text: string): Record<string, unknown> {
 // ── Tone system prompts ───────────────────────────────────────────────────────
 
 const TONE_SYSTEM: Record<string, string> = {
+  sales:
+    "You are an enthusiastic on-the-ground sales rep on WhatsApp — consultative, helpful, never stiff. Sound like a real person closing the next step (size, delivery, sample, price band). Use light emojis occasionally (😊👍). Keep lines short; build rapport; one clear ask at the end.",
   friendly:
     "You are a warm, helpful sales assistant. Use casual language and occasional emojis (😊👍). Keep sentences short and natural.",
   professional:
@@ -190,6 +192,17 @@ const TONE_SYSTEM: Record<string, string> = {
   premium:
     "You are a concise, authoritative advisor for a premium product. Responses should be brief, confident, and value-focused — no filler.",
 };
+
+function buildDefaultLanguageInstruction(languageMirrorMode: boolean): string {
+  if (languageMirrorMode) {
+    return `LANGUAGE: Match the customer's language and script from their latest message (e.g. English → English, Devanagari Hindi → Hindi in Devanagari).`;
+  }
+  return `LANGUAGE (default): Write in Hinglish — Hindi phrasing typed in Roman/English letters (WhatsApp style), e.g. "Kaise hain aap Sir", "aapka kitna quantity chahiye", "main abhi details bhejta hoon". Do NOT use Devanagari script unless the customer wrote in Devanagari. Plain English-only messages can get a short mix of simple English + Hinglish. Never default to stiff formal English.`;
+}
+
+function buildAddressingInstruction(): string {
+  return `ADDRESSING: Prefer "Sir" (or "Ma'am" only if the name or context clearly suggests). Do NOT use the lead's personal name in the message — it is for your context only. Never open with "Hi [Name]" or repeat their name; "Sir" is enough.`;
+}
 
 /**
  * Shown in interest-only mini prompts. Score reflects the last
@@ -448,10 +461,12 @@ export async function generateReply(
     catalogueLink?: string;
     restrictToKnowledgeBase?: boolean;
     autoShareCatalogue?: boolean;
+    /** false = Hinglish (Roman) default; true = match customer's language. */
+    languageMirrorMode?: boolean;
   } = {}
 ): Promise<ReplyResult> {
   const {
-    aiTone = "friendly",
+    aiTone = "sales",
     leadName = "there",
     context = [],
     handoverKeywords = ["price", "discount", "urgent", "complaint"],
@@ -460,6 +475,7 @@ export async function generateReply(
     catalogueLink = "",
     restrictToKnowledgeBase = false,
     autoShareCatalogue = true,
+    languageMirrorMode = false,
   } = options;
 
   const lower = customerMessage.toLowerCase();
@@ -467,7 +483,8 @@ export async function generateReply(
   const geminiKey = getGeminiKey();
   const openai = getOpenAI();
   const language = detectLanguageHeuristic(customerMessage);
-  const fallbackReply = () => heuristicReply(customerMessage, { aiTone, leadName, needsHuman, context });
+  const fallbackReply = () =>
+    heuristicReply(customerMessage, { aiTone, leadName, needsHuman, context, languageMirrorMode });
   const knowledgeBase = [companyInformation.trim(), productCatalogueInformation.trim()]
     .filter(Boolean)
     .join("\n\n");
@@ -486,7 +503,7 @@ export async function generateReply(
     catalogueAlreadySentInContext(context) && customerExplicitlyRequestsCatalogue(customerMessage);
   if (restrictToKnowledgeBase && !knowledgeBase) {
     const limitedReply =
-      "Thanks for your message! Our product information is being updated. We'll get back to you with the details shortly.";
+      "Thanks Sir! Product info abhi update ho rahi hai — thodi der mein main aapko details share kar dunga.";
     return {
       reply: finalizeReply({
         reply: limitedReply,
@@ -500,15 +517,15 @@ export async function generateReply(
     };
   }
   const isOngoing = context.length > 0;
-  const baseSystem = `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.friendly}
+  const baseSystem = `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.sales}
 You reply on behalf of Agribird Sales Person as a real team member — NOT a bot.
 CRITICAL: NEVER reveal or hint that you are an AI, bot, or automated system. Never say things like "as an AI", "I'm a bot", "connect you with a human", "our team will assist", or "a specialist will follow up". Respond naturally as a knowledgeable sales person.
-Reply in same language as customer.
+${buildDefaultLanguageInstruction(languageMirrorMode)}
+${buildAddressingInstruction()}
 Keep response 2-4 concise sentences.
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
-GREETING RULE: Do NOT start your reply with the customer's name or any greeting (e.g. "Hi Anant!", "Hii!", "Hello!"). ${isOngoing ? "This is an ongoing conversation — jump straight to the answer." : "Only use a greeting on the very first message if it feels natural, and keep it brief."}
-NAME RULE: Use the customer's name at most once per reply, and only when it adds warmth — never as an opener every time.
+GREETING RULE: Do NOT start with their personal name. ${isOngoing ? "Ongoing thread — get straight to the point; optional light \"Sir\"." : "Brief hello is ok; prefer addressing as Sir, not by name."}
 IMPORTANT: Never copy-paste raw catalogue lines or data codes. Always describe product details naturally in conversational sentences.
 ${restrictToKnowledgeBase ? "Use ONLY the provided business knowledge base as factual source. If the answer is not present, say you will look into it and get back to them shortly." : ""}
 ${shouldIncludeDetails ? "User is asking for product details. Describe the relevant product(s) naturally — include model name, size, key features, and carton/pack quantity if available. Do NOT list raw codes or paste catalogue lines." : ""}
@@ -519,7 +536,7 @@ ${needsHuman ? "The customer needs special attention. Acknowledge their concern 
     .slice(-8)
     .map((m) => `${m.direction === "in" ? "LEAD" : "AGENT"}: ${m.text}`)
     .join("\n");
-  const basePrompt = `Lead name: ${leadName}
+  const basePrompt = `Lead reference name (context only; do not address by name; use Sir): ${leadName}
 Conversation context:
 ${contextText || "(none)"}
 
@@ -581,11 +598,12 @@ Your previous answer was incomplete. Rewrite from scratch with full, natural com
           messages: [
             {
               role: "system",
-              content: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.friendly}
+              content: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.sales}
 You are replying on behalf of SATYAM AI CRM as a real team member — NOT a bot.
 CRITICAL: NEVER reveal or hint that you are an AI, bot, or automated system. Never say "connect you with a human", "our team will assist", or "a specialist will follow up". Respond naturally as a knowledgeable sales person.
-The lead's name is ${leadName}.
-Detect the language of the customer's message and reply in THE SAME LANGUAGE.
+${buildDefaultLanguageInstruction(languageMirrorMode)}
+${buildAddressingInstruction()}
+Lead's name (context only, do not use in the reply; use Sir): ${leadName}.
 Keep replies concise (2-4 sentences max).
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
@@ -654,8 +672,9 @@ export async function generateFollowUp(options: {
     daysSinceLastMessage,
     lastMessage,
     followUpDelayDays = 2,
-    followUpTemplate = "Hey {{name}}, just checking in! Have you had a chance to review our proposal?",
-    aiTone = "friendly",
+    followUpTemplate =
+      "Hello Sir! 😊 Just checking in — kya aapne proposal dekh liya? Koi doubt ho to bataiye.",
+    aiTone = "sales",
   } = options;
 
   const shouldSend = daysSinceLastMessage >= followUpDelayDays;
@@ -671,20 +690,21 @@ export async function generateFollowUp(options: {
   const openai = getOpenAI();
   const followUpFallback = () =>
     followUpTemplate
-      .replace(/{{name}}/gi, leadName)
+      .replace(/{{name}}/gi, "Sir")
       .replace(/{{days}}/gi, String(daysSinceLastMessage));
 
   if (geminiKey) {
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const text = await callGemini({
-          system: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.friendly}
+          system: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.sales}
 You write follow-up messages for leads who have not responded.
+Address as Sir, not by personal name. Prefer Hinglish (Roman Hindi) unless the lead only used another language.
 Keep it under 3 sentences and avoid sounding pushy.
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
 ${attempt === 1 ? "Your previous response was incomplete. Rewrite from scratch as a complete follow-up." : ""}`,
-          prompt: `Lead name: ${leadName}
+          prompt: `Lead context name (do not use in text; say Sir): ${leadName}
 Days without response: ${daysSinceLastMessage}
 Last message from lead: "${lastMessage}"
 Template hint: "${followUpTemplate}"
@@ -719,10 +739,9 @@ Return only follow-up text.`,
           messages: [
             {
               role: "system",
-              content: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.friendly}
+              content: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.sales}
 You write follow-up messages for leads who have not responded.
-Use the provided template as a guide but personalise it naturally.
-Replace {{name}} with the lead's actual name.
+Use the template as a guide. Address as Sir (not by name). Prefer Hinglish in Roman script.
 Keep it under 3 sentences. Do not sound pushy.
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
@@ -798,12 +817,23 @@ function heuristicReply(
   customerMessage: string,
   {
     aiTone,
-    leadName,
+    leadName: _leadName,
     needsHuman,
     context,
-  }: { aiTone: string; leadName: string; needsHuman: boolean; context: IncomingMessage[] }
+    languageMirrorMode = false,
+  }: {
+    aiTone: string;
+    leadName: string;
+    needsHuman: boolean;
+    context: IncomingMessage[];
+    languageMirrorMode?: boolean;
+  }
 ): ReplyResult {
-  const language = detectLanguageHeuristic(customerMessage);
+  void _leadName;
+  let language = detectLanguageHeuristic(customerMessage);
+  if (!languageMirrorMode && language === "English") {
+    language = "Hindi";
+  }
   const lower = customerMessage.toLowerCase();
   const lastOutbound = [...context].reverse().find((m) => m.direction === "out")?.text?.trim();
   const outboundCount = context.filter((m) => m.direction === "out").length;
@@ -816,35 +846,37 @@ function heuristicReply(
 
   let reply: string;
   if (needsHuman) {
-    reply = localizedHandoverReply(language, leadName, aiTone);
+    reply = localizedHandoverReply(language, aiTone);
   } else if (wantsCatalogue && repeatCatRequest) {
     reply =
       language === "Hindi"
-        ? `Catalogue PDF pehle hi isi chat mein upar bhej diya gaya hai — thoda scroll karke dubara khol sakte hain. Kaunsa product ya model aapko chahiye, bataiye!`
+        ? `Catalogue PDF pehle hi isi chat mein upar bhej diya gaya hai — thoda scroll karke dubara khol sakte hain. Kaunsa product ya model chahiye Sir, bataiye!`
         : language === "Urdu"
         ? `Catalogue PDF pehle hi is chat mein upar bheja ja chuka hai — scroll kar ke dobara khol lein. Kaunsa product aap chahte hain?`
-        : `We already shared the catalogue PDF earlier in this chat — just scroll up a bit to open it again. Which product or model are you looking for?`;
+        : `Sir, catalogue PDF pehle hi is chat mein upar share ho chuki hai — scroll up karke dekh lijiye. Kaunsa product / model aapka focus hai?`;
   } else if (wantsCatalogue) {
     reply =
       language === "Hindi"
-        ? `Bilkul, ${leadName}! 😊 Main abhi aapko AgriBird product catalogue PDF bhej raha hoon. Koi bhi sawaal ho toh zaroor poochein!`
-        : `Sure, ${leadName}! 😊 I'm sending you our AgriBird product catalogue PDF right now. Feel free to ask if you have any questions!`;
+        ? `Bilkul Sir! 😊 Main abhi AgriBird product catalogue PDF bhej raha hoon. Koi bhi sawaal ho toh zaroor poochein!`
+        : language === "Urdu"
+        ? `Zaroor Sir! 😊 Main abhi AgriBird catalogue PDF bhej raha hoon — koi sawaal ho to poochiye.`
+        : `Sure Sir! 😊 Sending the AgriBird catalogue PDF now — boliye agar kuch aur chahiye.`;
   } else if (lower.includes("demo") || lower.includes("meeting") || lower.includes("call")) {
-    reply = localizedDemoReply(language, leadName, aiTone);
+    reply = localizedDemoReply(language, aiTone);
   } else if (lower.includes("price") || lower.includes("cost") || lower.includes("plan")) {
-    reply = localizedPricingReply(language, leadName, aiTone);
+    reply = localizedPricingReply(language, aiTone);
   } else if (isFirstReply) {
-    reply = localizedGreetingReply(language, leadName, aiTone);
+    reply = localizedGreetingReply(language, aiTone);
   } else {
-    reply = localizedGenericReply(language, leadName, aiTone);
+    reply = localizedGenericReply(language, aiTone);
   }
 
   if (lastOutbound && normalizeText(lastOutbound) === normalizeText(reply)) {
     reply += language === "Hindi"
-      ? " Aap apni exact requirement share karein, main best option suggest karta hoon."
+      ? " Aap apni exact requirement share kar dijiye Sir, main best option suggest karta hoon."
       : language === "Urdu"
       ? " Aap apni exact requirement share karein, main behtareen option suggest karta hoon."
-      : " Share your exact requirement and I will suggest the best next step.";
+      : " Sir, exact requirement bata dijiyega — main best next step suggest kar dunga.";
   }
 
   return { reply, language, needsHuman, engine: "heuristic", sharedCatalogue: false };
@@ -1014,66 +1046,66 @@ function isAffirmativeForDetails(message: string, context: IncomingMessage[]): b
   return /\b(details?|catalog|catalogue|brochure|price|pricing|spec|carton|qty|quantity|model)\b/.test(recent);
 }
 
-function localizedGreetingReply(language: string, leadName: string, aiTone: string): string {
+function localizedGreetingReply(language: string, aiTone: string): string {
   if (language === "Hindi") {
     return aiTone === "professional"
-      ? `Namaste ${leadName}, message ke liye dhanyavaad. Kripya batayein aapko kis service mein help chahiye.`
-      : `Hi ${leadName}! 😊 Message ke liye thanks. Aapko kis cheez mein help chahiye?`;
+      ? `Namaste Sir, message ke liye dhanyavaad. Please bataiye kis product / service mein help chahiye.`
+      : `Hello Sir! 😊 Thanks for message — kaunsa product ya quantity dekh rahe ho, bataiye?`;
   }
   if (language === "Urdu") {
-    return `Assalamualaikum ${leadName}! Shukriya, aap ko kis cheez mein help chahiye?`;
+    return `Assalamualaikum Sir! Shukriya — kis cheez mein help chahiye?`;
   }
   return aiTone === "professional"
-    ? `Hi ${leadName}, thank you for your message. Please share your requirement and I will help you with the right option.`
-    : `Hi ${leadName}! 😊 Thanks for reaching out. Tell me what you need and I will help right away.`;
+    ? `Thank you for writing in, Sir. Please share your requirement so I can suggest the right option.`
+    : `Hi Sir! 😊 Thanks for reaching out — bataiye kya requirement hai, main help kar dunga.`;
 }
 
-function localizedGenericReply(language: string, leadName: string, aiTone: string): string {
+function localizedGenericReply(language: string, aiTone: string): string {
   if (language === "Hindi") {
     return aiTone === "premium"
-      ? `${leadName}, aapki requirement note kar raha hoon. Main aapko best-fit solution suggest karta hoon.`
-      : `${leadName}, samajh gaya. Aap apna use-case thoda detail mein share karein, main best option bata deta hoon.`;
+      ? `Samajh gaya Sir. Aapki requirement note kar raha hoon — best-fit option bata dunga.`
+      : `Samajh gaya Sir 😊 Thoda use-case detail mein bata dijiye, main best option suggest kar dunga.`;
   }
   if (language === "Urdu") {
-    return `${leadName}, samajh gaya. Aap apni requirement thori detail mein bhej dein, main best option suggest karta hoon.`;
+    return `Samajh gaya Sir. Thori si detail bhej dein, main best option suggest karta hoon.`;
   }
   return aiTone === "professional"
-    ? `Thank you, ${leadName}. Please share a bit more detail so I can guide you accurately.`
-    : `Got it, ${leadName}. Share a bit more detail and I will suggest the best option for you.`;
+    ? `Thank you, Sir. A bit more detail and I can guide you accurately.`
+    : `Got it Sir! Thoda detail share kariye, main sahi option suggest kar dunga.`;
 }
 
-function localizedDemoReply(language: string, leadName: string, aiTone: string): string {
+function localizedDemoReply(language: string, aiTone: string): string {
   if (language === "Hindi") {
-    return `${leadName}, demo schedule kar dete hain. Aapka preferred date aur time kya rahega?`;
+    return `Sir, demo set kar lete hain — kaun sa date & time aapke liye theek rahega?`;
   }
   if (language === "Urdu") {
-    return `${leadName}, demo schedule kar dete hain. Aap ka preferred date aur time kya hoga?`;
+    return `Sir, demo schedule kar lete hain — preferred date & time?`;
   }
   return aiTone === "professional"
-    ? `Absolutely, ${leadName}. I can schedule a demo for you. Please share your preferred date and time.`
-    : `Great, ${leadName}! Let's schedule a demo. What date and time works best for you?`;
+    ? `Sure Sir, I can set up a demo. Please share a preferred date and time.`
+    : `Zaroor Sir! Demo ke liye kaun sa date & time bataiye?`;
 }
 
-function localizedPricingReply(language: string, leadName: string, aiTone: string): string {
+function localizedPricingReply(language: string, aiTone: string): string {
   if (language === "Hindi") {
-    return `${leadName}, pricing aapke use-case par depend karti hai. Team size aur requirement share karein, main exact quote bhejta hoon.`;
+    return `Sir, pricing aapke use-case aur quantity pe depend karti hai — thoda order size / model bata dijiye, main exact quote share kar dunga.`;
   }
   if (language === "Urdu") {
-    return `${leadName}, pricing aap ki requirement pe depend karti hai. Team size share karein, main exact quote bhejta hoon.`;
+    return `Sir, pricing requirement pe depend karti hai — quantity / model bata dijiye, main exact quote bhejta hoon.`;
   }
   return aiTone === "premium"
-    ? `Our plans are tailored for your needs, ${leadName}. Share your team size and I will send a precise quote.`
-    : `Great question, ${leadName}. Pricing depends on your use case and team size. Share those and I will send an exact quote.`;
+    ? `Sir, plans depend on your exact need. Share team size or qty and I will send a precise quote.`
+    : `Good question Sir — price use-case & qty pe based hai. Woh bata dijiyega, exact quote bhej dunga.`;
 }
 
-function localizedHandoverReply(language: string, leadName: string, aiTone: string): string {
+function localizedHandoverReply(language: string, aiTone: string): string {
   if (language === "Hindi") {
-    return `${leadName}, bilkul samajh gaya. Main is par dhyan de raha hoon aur jald hi aapko update karunga.`;
+    return `Bilkul Sir, samajh gaya. Is par main check karke jald aapko update kar dunga.`;
   }
   if (language === "Urdu") {
-    return `${leadName}, shukriya. Main is par ghour kar raha hoon aur jald update karunga.`;
+    return `Zaroor Sir, main is par dhyan deke jald update karunga.`;
   }
   return aiTone === "professional"
-    ? `Thank you, ${leadName}. I will look into this and get back to you shortly.`
-    : `Got it, ${leadName}! I'll look into this and get back to you soon.`;
+    ? `Noted, Sir. I will look into this and get back to you shortly.`
+    : `Thik hai Sir! Main dekh ke jald reply kar dunga.`;
 }

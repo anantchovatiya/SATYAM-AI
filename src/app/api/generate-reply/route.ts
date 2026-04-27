@@ -13,7 +13,8 @@
  *   leadName?:       string;
  *   context?:        { text: string; direction: "in" | "out" }[];  // recent messages for context
  *   settings?: {
- *     aiTone?:             "friendly" | "professional" | "premium";
+ *     aiTone?:             "sales" | "friendly" | "professional" | "premium";
+ *     languageMirrorMode?: boolean;
  *     handoverKeywords?:   string[];
  *     companyInformation?: string;
  *     productCatalogueInformation?: string;
@@ -43,7 +44,7 @@ export async function POST(req: NextRequest) {
     const leadName: string       = body.leadName ?? "there";
     const context                = Array.isArray(body.context) ? body.context : [];
     const settings               = body.settings ?? {};
-    const aiTone: string         = settings.aiTone ?? "friendly";
+    const aiTone: string         = settings.aiTone ?? "sales";
     const handoverKeywords: string[] = Array.isArray(settings.handoverKeywords)
       ? settings.handoverKeywords
       : ["price", "discount", "urgent", "complaint"];
@@ -64,6 +65,7 @@ export async function POST(req: NextRequest) {
       catalogueLink: kb.catalogueLink,
       restrictToKnowledgeBase: kb.restrictToKnowledgeBase,
       autoShareCatalogue: settings.autoShareCatalogue !== false,
+      languageMirrorMode: settings.languageMirrorMode === true,
     });
 
     return NextResponse.json({

@@ -546,6 +546,7 @@ async function processQrInboundAutoReply(args: {
       catalogueLink: kb.catalogueLink,
       restrictToKnowledgeBase: kb.restrictToKnowledgeBase,
       autoShareCatalogue: settings.autoShareCatalogue,
+      languageMirrorMode: settings.languageMirrorMode,
     });
     const safeReplyText = coerceCompleteReply(reply.reply, lead?.name ?? args.senderName);
     if (safeReplyText !== reply.reply.trim().replace(/\s+/g, " ")) {
@@ -723,6 +724,7 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
         catalogueLink: kb.catalogueLink,
         restrictToKnowledgeBase: kb.restrictToKnowledgeBase,
         autoShareCatalogue: settings.autoShareCatalogue,
+        languageMirrorMode: settings.languageMirrorMode,
       });
       const safeReplyText = coerceCompleteReply(reply.reply, lead?.name ?? msg.senderName ?? "there");
       if (safeReplyText !== reply.reply.trim().replace(/\s+/g, " ")) {
@@ -1288,8 +1290,9 @@ function sleep(ms: number): Promise<void> {
 }
 
 function coerceCompleteReply(reply: string, leadName: string): string {
+  void leadName;
   const compact = reply.trim().replace(/\s+/g, " ");
-  const fallback = `Thanks ${leadName}. Could you share a bit more detail so I can help you accurately?`;
+  const fallback = `Thanks Sir. Thoda aur detail bata dijiyega, main sahi se help kar dunga.`;
   if (!compact || compact.length < 10) return fallback;
 
   // Strip the Details/Catalogue appendix before checking the core sentence

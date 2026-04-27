@@ -243,6 +243,7 @@ function KeywordInput({
 
 // ── AI Tone selector ───────────────────────────────────────────────────────────
 const TONE_OPTIONS: { value: AiTone; label: string; desc: string; color: string }[] = [
+  { value: "sales",        label: "Sales (default)", desc: "WhatsApp-style rep — helpful, closing the next step", color: "border-amber-400 bg-amber-50 dark:bg-amber-950/30" },
   { value: "friendly",     label: "Friendly",     desc: "Warm, casual, emoji-friendly",      color: "border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20" },
   { value: "professional", label: "Professional", desc: "Formal, structured, business-ready", color: "border-blue-400 bg-blue-50 dark:bg-blue-900/20" },
   { value: "premium",      label: "Premium",      desc: "Concise, authoritative, high-end",   color: "border-violet-400 bg-violet-50 dark:bg-violet-900/20" },
@@ -409,8 +410,8 @@ export function AutomationClient({
           <Toggle
             checked={form.languageMirrorMode}
             onChange={(v) => set("languageMirrorMode", v)}
-            label="Language Mirror Mode"
-            description="Detect and reply in the same language as the lead."
+            label="Language mirror (match lead)"
+            description="On: reply in the same language/script as the lead. Off (default): Hinglish — Hindi in English letters, like WhatsApp, e.g. aapka quantity kya hai."
             icon={Languages}
             accent="bg-blue-500"
           />
@@ -500,7 +501,7 @@ export function AutomationClient({
 
         {/* ── Section 3: AI Tone ── */}
         <Section title="AI Tone" subtitle="Choose the voice and style of all automated messages">
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {TONE_OPTIONS.map((opt) => (
               <button
                 key={opt.value}
@@ -520,6 +521,7 @@ export function AutomationClient({
                 )}
                 <Sparkles className={cn(
                   "mb-2 h-5 w-5",
+                  opt.value === "sales" ? "text-amber-500" :
                   opt.value === "friendly" ? "text-emerald-500" :
                   opt.value === "professional" ? "text-blue-500" : "text-violet-500"
                 )} />
@@ -535,6 +537,7 @@ export function AutomationClient({
               Preview — {form.aiTone}
             </p>
             <p className="text-sm text-slate-700 dark:text-slate-200 italic">
+              {form.aiTone === "sales" && "\"Sir, is quantity ka best rate bata deta hoon — delivery pincode bhi bata dijiyega, main check karke confirm kar dunga! 😊\""}
               {form.aiTone === "friendly" && "\"Hey there! 😊 Just wanted to check in — did you get a chance to look at what we sent over?\""}
               {form.aiTone === "professional" && "\"Dear Sir/Madam, I am following up regarding our previous correspondence. Please let me know if you require further information.\""}
               {form.aiTone === "premium" && "\"As discussed, I wanted to ensure you had everything needed to make an informed decision. I'm available at your convenience.\""}

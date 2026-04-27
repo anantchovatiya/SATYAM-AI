@@ -246,8 +246,9 @@ function phoneVariants(phone: string): string[] {
 }
 
 function coerceCompleteReply(reply: string, leadName: string): string {
+  void leadName;
   const compact = reply.trim().replace(/\s+/g, " ");
-  const fallback = `Thanks ${leadName}. Could you share a bit more detail so I can help you accurately?`;
+  const fallback = `Thanks Sir. Thoda aur detail bata dijiyega, main sahi se help kar dunga.`;
   if (!compact || compact.length < 10) return fallback;
 
   const core = compact
