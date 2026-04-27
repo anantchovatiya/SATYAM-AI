@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import type { AutomationSettingsClient, AiTone } from "@/lib/models/settings";
+import { formatLeadPhoneFromCanonical, canonicalWaContactKey } from "@/lib/wa-phone";
 import { cn } from "@/lib/cn";
 import {
   Bot,
@@ -20,6 +21,8 @@ import {
   BookOpen,
   ExternalLink,
   Gauge,
+  Timer,
+  UserX,
 } from "lucide-react";
 
 // ── Toggle switch ──────────────────────────────────────────────────────────────
@@ -66,6 +69,92 @@ function Toggle({
           )}
         />
       </button>
+    </div>
+  );
+}
+
+const MAX_AUTO_REPLY_EXCLUDED = 500;
+
+// ── Excluded numbers (no auto-reply) ───────────────────────────────────────────
+function ExcludedPhoneInput({
+  phones,
+  onChange,
+}: {
+  phones: string[];
+  onChange: (phones: string[]) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  function add() {
+    const c = canonicalWaContactKey(draft.trim());
+    if (!c) {
+      setDraft("");
+      return;
+    }
+    if (phones.length >= MAX_AUTO_REPLY_EXCLUDED) {
+      setDraft("");
+      return;
+    }
+    if (phones.includes(c)) {
+      setDraft("");
+      return;
+    }
+    onChange([...phones, c]);
+    setDraft("");
+    inputRef.current?.focus();
+  }
+
+  function remove(canon: string) {
+    onChange(phones.filter((p) => p !== canon));
+  }
+
+  return (
+    <div
+      onClick={() => inputRef.current?.focus()}
+      className="min-h-[44px] cursor-text flex flex-wrap items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2 py-1.5 dark:border-slate-600 dark:bg-slate-900"
+    >
+      {phones.map((p) => (
+        <span
+          key={p}
+          className="inline-flex items-center gap-0.5 rounded-md bg-slate-100 py-0.5 pl-2 pr-1 text-xs text-slate-800 dark:bg-slate-800 dark:text-slate-200"
+        >
+          {formatLeadPhoneFromCanonical(p)}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              remove(p);
+            }}
+            className="ml-0.5 rounded-full p-0.5 hover:text-red-700 dark:hover:text-red-200"
+            aria-label={`Remove ${p}`}
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </span>
+      ))}
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === ",") {
+            e.preventDefault();
+            add();
+          }
+          if (e.key === "Backspace" && !draft && phones.length) {
+            onChange(phones.slice(0, -1));
+          }
+        }}
+        inputMode="tel"
+        autoComplete="off"
+        placeholder={
+          phones.length === 0
+            ? "Add phone — e.g. +91 98765 43210, press Enter…"
+            : "Add another…"
+        }
+        className="min-w-[12rem] flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
+      />
     </div>
   );
 }
@@ -162,6 +251,12 @@ const TONE_OPTIONS: { value: AiTone; label: string; desc: string; color: string 
 // ── Unsaved indicator ──────────────────────────────────────────────────────────
 function UnsavedDot() {
   return <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" title="Unsaved changes" />;
+}
+
+function parseSettingsDate(d: Date | string | undefined): Date | null {
+  if (d == null) return null;
+  const t = d instanceof Date ? d : new Date(d);
+  return Number.isNaN(t.getTime()) ? null : t;
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -261,6 +356,56 @@ export function AutomationClient({
             icon={Bot}
             accent="bg-primary"
           />
+          <div className="ml-0 space-y-2 rounded-xl border border-slate-100 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-800/30">
+            <div className="flex items-center gap-2 text-sm font-medium text-slate-800 dark:text-slate-200">
+              <Timer className="h-4 w-4 text-slate-500" />
+              Pause after I send (inbox)
+            </div>
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              When you send a message or attachment from the inbox, AI auto-reply pauses for the minutes below.
+              Each send extends the pause. Set to <strong>0</strong> to keep auto-reply running (no pause).
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={1440}
+                value={form.autoReplyPauseAfterManualMinutes ?? 0}
+                onChange={(e) =>
+                  set("autoReplyPauseAfterManualMinutes", Math.max(0, Math.min(1440, Number(e.target.value) || 0)))
+                }
+                className="h-10 w-24 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium dark:border-slate-600 dark:bg-slate-900"
+              />
+              <span className="text-sm text-slate-600 dark:text-slate-300">minutes</span>
+            </div>
+            {(() => {
+              const end = parseSettingsDate(form.autoReplySuppressedUntil);
+              if (!end || end.getTime() <= Date.now()) return null;
+              return (
+                <p className="text-xs text-amber-800 dark:text-amber-200/90">
+                  Auto-reply is paused from a recent manual send until{" "}
+                  <strong>
+                    {end.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+                  </strong>{" "}
+                  (refresh the page to update).
+                </p>
+              );
+            })()}
+          </div>
+          <div className="ml-0 space-y-2 rounded-xl border border-slate-100 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-800/30">
+            <div className="flex items-center gap-2 text-sm font-medium text-slate-800 dark:text-slate-200">
+              <UserX className="h-4 w-4 text-slate-500" />
+              No auto-reply for these contacts
+            </div>
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              AI will not auto-reply to these numbers. Use the same country code and number you see in the inbox. Up to{" "}
+              {MAX_AUTO_REPLY_EXCLUDED} contacts.
+            </p>
+            <ExcludedPhoneInput
+              phones={form.autoReplyExcludedPhones ?? []}
+              onChange={(v) => set("autoReplyExcludedPhones", v)}
+            />
+          </div>
           <Toggle
             checked={form.languageMirrorMode}
             onChange={(v) => set("languageMirrorMode", v)}

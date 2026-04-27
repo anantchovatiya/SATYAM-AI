@@ -4,6 +4,8 @@ import { Boom } from "@hapi/boom";
 import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
+import { isPhoneExcludedFromAutoReply } from "@/lib/auto-reply-exclusions";
+import { isAutoReplySuppressedAfterManualSend } from "@/lib/auto-reply-pause";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
@@ -451,6 +453,14 @@ async function processQrInboundAutoReply(args: {
       store.processedInboundIds.add(inboundId);
       return;
     }
+    if (isAutoReplySuppressedAfterManualSend(settings)) {
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
+    if (isPhoneExcludedFromAutoReply(settings, args.from)) {
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
 
     const messagesCol = waMessagesCollection(db);
     const leadsCol = leadsCollection(db);
@@ -645,6 +655,14 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
       }
 
       if (!settings.autoReply) {
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+      if (isAutoReplySuppressedAfterManualSend(settings)) {
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+      if (isPhoneExcludedFromAutoReply(settings, msg.from)) {
         store.processedInboundIds.add(inboundId);
         continue;
       }

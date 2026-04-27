@@ -1,4 +1,5 @@
 import { ObjectId, type Collection, type Db } from "mongodb";
+import { normalizeAutoReplyExcludedPhones } from "@/lib/auto-reply-exclusions";
 
 export type AiTone = "friendly" | "professional" | "premium";
 
@@ -20,6 +21,18 @@ export interface AutomationSettings {
   workspaceId?: string;
   whatsappEnvDisabled?: boolean;
   autoReply: boolean;
+  /**
+   * How long to pause AI auto-reply after you send a message from the inbox (0 = do not pause).
+   * Each manual send extends the window. Stored end time: `autoReplySuppressedUntil`.
+   */
+  autoReplyPauseAfterManualMinutes: number;
+  /** Set server-side when you send from the app; auto-reply skips until this time. */
+  autoReplySuppressedUntil?: Date;
+  /**
+   * Canonical phone digits (`canonicalWaContactKey`); no AI auto-reply for these contacts.
+   * Example: 919876543210
+   */
+  autoReplyExcludedPhones: string[];
   followUpDelayDays: number;
   /** Only run auto follow-up when `lead.interestScore` is at least this (0 = no minimum). */
   followUpMinInterestScore: number;
@@ -40,6 +53,8 @@ export interface AutomationSettings {
 
 export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id" | "userId"> = {
   autoReply: true,
+  autoReplyPauseAfterManualMinutes: 30,
+  autoReplyExcludedPhones: [],
   followUpDelayDays: 2,
   followUpMinInterestScore: 0,
   humanHandoverKeywords: ["price", "discount", "urgent", "complaint"],
@@ -80,6 +95,11 @@ export async function getOrCreateSettings(db: Db, userId: ObjectId): Promise<Aut
       ...DEFAULT_SETTINGS,
       ...doc,
       userId,
+      autoReplyPauseAfterManualMinutes:
+        typeof doc.autoReplyPauseAfterManualMinutes === "number"
+          ? doc.autoReplyPauseAfterManualMinutes
+          : DEFAULT_SETTINGS.autoReplyPauseAfterManualMinutes,
+      autoReplyExcludedPhones: normalizeAutoReplyExcludedPhones(doc.autoReplyExcludedPhones),
       followUpMinInterestScore:
         typeof doc.followUpMinInterestScore === "number" ? doc.followUpMinInterestScore : DEFAULT_SETTINGS.followUpMinInterestScore,
     };

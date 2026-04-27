@@ -21,6 +21,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { ObjectId, type Db } from "mongodb";
+import { isPhoneExcludedFromAutoReply } from "@/lib/auto-reply-exclusions";
+import { isAutoReplySuppressedAfterManualSend } from "@/lib/auto-reply-pause";
 import { getDb }               from "@/lib/mongodb";
 import { leadsCollection }     from "@/lib/models/lead";
 import {
@@ -416,6 +418,19 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   // ── 9. Auto-reply gate ───────────────────────────────────────────────────────
   if (!settings.autoReply) {
     addEvent("reply_skipped", { reason: "autoReply is disabled in settings" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
+    return { leadId, status: "skipped" };
+  }
+  if (isAutoReplySuppressedAfterManualSend(settings)) {
+    addEvent("reply_skipped", {
+      reason: "autoReply paused after manual send from inbox",
+      resumeAt: settings.autoReplySuppressedUntil?.toISOString?.() ?? null,
+    });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
+    return { leadId, status: "skipped" };
+  }
+  if (isPhoneExcludedFromAutoReply(settings, msg.from)) {
+    addEvent("reply_skipped", { reason: "autoReply excluded for this contact in settings" });
     await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }

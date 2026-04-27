@@ -17,6 +17,7 @@ import {
 import { resolveQrRecipient } from "@/lib/wa-qr-recipient";
 import { getQrSnapshot, sendQrTextMessage } from "@/lib/whatsapp-qr-connector";
 import { requireApiUser } from "@/lib/auth/session";
+import { applyManualSendAutoReplySuppression } from "@/lib/auto-reply-pause";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 
@@ -148,6 +149,12 @@ export async function POST(req: NextRequest) {
 
     const leadPhone = leadAfterSend?.phone ?? formatLeadPhoneFromRaw(to);
     await refreshLeadInterestScoreFromWaThread(db, userId, fromKey, leadPhone).catch(() => {});
+
+    await applyManualSendAutoReplySuppression(
+      db,
+      userId,
+      settings.autoReplyPauseAfterManualMinutes
+    ).catch(() => {});
 
     const targetUsed = channel === "qr" ? qrTarget : to;
     const recipientDigits =

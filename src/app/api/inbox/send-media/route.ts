@@ -22,6 +22,7 @@ import {
   sendQrImageMessage,
 } from "@/lib/whatsapp-qr-connector";
 import { requireApiUser } from "@/lib/auth/session";
+import { applyManualSendAutoReplySuppression } from "@/lib/auto-reply-pause";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 
@@ -209,6 +210,12 @@ export async function POST(req: NextRequest) {
       userId,
       fromKey,
       leadAfterSend?.phone ?? formatLeadPhoneFromRaw(to)
+    ).catch(() => {});
+
+    await applyManualSendAutoReplySuppression(
+      db,
+      userId,
+      settings.autoReplyPauseAfterManualMinutes
     ).catch(() => {});
 
     return NextResponse.json({

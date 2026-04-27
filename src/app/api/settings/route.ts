@@ -5,6 +5,7 @@ import {
   getOrCreateSettings,
   type AutomationSettings,
 } from "@/lib/models/settings";
+import { normalizeAutoReplyExcludedPhones } from "@/lib/auto-reply-exclusions";
 import { requireApiUser } from "@/lib/auth/session";
 
 function clampInt(v: unknown, lo: number, hi: number): number {
@@ -41,11 +42,13 @@ export async function PUT(req: NextRequest) {
     // Do not put userId in $set together with $setOnInsert:{ userId } — MongoDB rejects duplicate paths.
     const update: Partial<AutomationSettings> = {
       autoReply: Boolean(body.autoReply),
+      autoReplyPauseAfterManualMinutes: clampInt(body.autoReplyPauseAfterManualMinutes, 0, 24 * 60),
       followUpDelayDays: Number(body.followUpDelayDays) || 1,
       followUpMinInterestScore: clampInt(body.followUpMinInterestScore, 0, 100),
       humanHandoverKeywords: Array.isArray(body.humanHandoverKeywords)
         ? body.humanHandoverKeywords.map(String)
         : [],
+      autoReplyExcludedPhones: normalizeAutoReplyExcludedPhones(body.autoReplyExcludedPhones),
       languageMirrorMode: Boolean(body.languageMirrorMode),
       businessCardAutoSend: Boolean(body.businessCardAutoSend),
       restrictToKnowledgeBase: Boolean(body.restrictToKnowledgeBase),
