@@ -38,6 +38,8 @@ export interface WaMessage {
   mediaKind?: "image" | "video" | "document" | "sticker" | "audio";
   mediaWaId?: string;
   mediaMime?: string;
+  /** QR/Baileys: relative path under `.wa-media` (POSIX `userHex/file.ext`). */
+  qrMediaRelPath?: string;
 }
 
 // ── Webhook log document ──────────────────────────────────────────────────────

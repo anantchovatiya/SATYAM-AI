@@ -1,21 +1,37 @@
 import path from "node:path";
 import { rm, readFile } from "node:fs/promises";
 import { Boom } from "@hapi/boom";
+import { isJidBroadcast, isJidNewsletter } from "@whiskeysockets/baileys";
 import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
-import { isAutoReplyExcludedForQrInbound } from "@/lib/wa-qr-lid-mapping";
+import {
+  shouldSkipAutoReplyForInboundStoredMessage,
+  shouldSkipAutoReplyForInboundText,
+} from "@/lib/auto-reply-skip-media";
+import {
+  canonicalQrThreadFromLocalPart,
+  isAutoReplyExcludedForQrInbound,
+} from "@/lib/wa-qr-lid-mapping";
 import { isAutoReplySuppressedAfterManualSend } from "@/lib/auto-reply-pause";
 import { getOrCreateSettings } from "@/lib/models/settings";
-import { waMessagesCollection } from "@/lib/models/webhook-log";
+import { waMessagesCollection, type WaMessage } from "@/lib/models/webhook-log";
 import { getConversationStatus, shouldEscalateConversation } from "@/lib/conversation-status";
 import { analyzeChat, generateReply, type AnalyzeResult } from "@/lib/ai";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
-import { bestPhoneLocalPartFromBaileysKey } from "@/lib/wa-phone";
+import { bestPhoneLocalPartFromBaileysKey, mongoMatchStoredWaFromForUser } from "@/lib/wa-phone";
+import { detectBaileysMediaKind, saveQrDownloadedMedia } from "@/lib/wa-qr-media-storage";
 /** Gemini Vision on inbound images — costs API. Set `true` to re-enable business-card scan + Excel. */
 const ENABLE_BUSINESS_CARD_IMAGE_SCAN = false;
+
+/** Status/stories use `status@broadcast` (+ `remoteJidAlt` = poster). Do not treat as 1:1 chat. */
+function isBaileysNonDirectThreadJid(remoteJid?: string | null): boolean {
+  if (!remoteJid) return false;
+  if (isJidBroadcast(remoteJid)) return true;
+  return Boolean(isJidNewsletter(remoteJid));
+}
 
 export type QrConnectionState =
   | "idle"
@@ -145,6 +161,8 @@ function extractText(message: unknown): string {
     extendedTextMessage?: { text?: string };
     imageMessage?: { caption?: string };
     videoMessage?: { caption?: string };
+    documentMessage?: { caption?: string; fileName?: string };
+    audioMessage?: { caption?: string };
   };
 
   return (
@@ -152,6 +170,9 @@ function extractText(message: unknown): string {
     m?.extendedTextMessage?.text ??
     m?.imageMessage?.caption ??
     m?.videoMessage?.caption ??
+    m?.documentMessage?.caption ??
+    m?.documentMessage?.fileName ??
+    m?.audioMessage?.caption ??
     ""
   );
 }
@@ -266,48 +287,53 @@ async function persistIncomingOrOutgoingMessage(args: {
   text: string;
   direction: "in" | "out";
   timestamp?: Date;
+  mediaKind?: WaMessage["mediaKind"];
+  mediaMime?: string;
+  qrMediaRelPath?: string;
 }) {
   const db = await getDb();
   const messagesCol = waMessagesCollection(db);
   const leadsCol = leadsCollection(db);
   const now = args.timestamp ?? new Date();
-  const normalizedPhone = normalizePhone(args.from);
+  const authDir = getWaAuthDir(args.userId.toHexString());
+  const fromKey = await canonicalQrThreadFromLocalPart(authDir, args.from);
+  const normalizedPhone = normalizePhone(fromKey);
   const uid = args.userId;
 
-  if (args.direction === "out") {
-    const duplicateWindowStart = new Date(now.getTime() - 20_000);
-    const recentDuplicate = await messagesCol.findOne({
-      userId: uid,
-      from: args.from,
-      direction: "out",
-      text: args.text,
-      timestamp: { $gte: duplicateWindowStart },
-    });
-    if (recentDuplicate) {
-      return;
-    }
+  let textToStore = args.text;
+  const existingMsg = await messagesCol.findOne({ userId: uid, waMessageId: args.waMessageId });
+  if (
+    args.direction === "out" &&
+    existingMsg?.text &&
+    existingMsg.text.trimStart().startsWith("📷") &&
+    (args.text === "[Image]" || args.text === "[Media]" || args.text === "[Video]")
+  ) {
+    textToStore = existingMsg.text;
   }
 
-  await messagesCol
-    .updateOne(
-      { userId: uid, waMessageId: args.waMessageId },
-      {
-        $setOnInsert: {
-          userId: uid,
-          waMessageId: args.waMessageId,
-          from: args.from,
-          remoteJid: args.remoteJid,
-          ...(args.remoteJidAlt ? { remoteJidAlt: args.remoteJidAlt } : {}),
-          senderName: args.senderName ?? normalizedPhone,
-          text: args.text,
-          timestamp: now,
-          direction: args.direction,
-          phoneNumberId: "qr-linked",
-        },
-      },
-      { upsert: true }
-    )
-    .catch(() => {});
+  const $set: Record<string, unknown> = {
+    userId: uid,
+    waMessageId: args.waMessageId,
+    from: fromKey,
+    senderName: args.senderName ?? normalizedPhone,
+    text: textToStore,
+    timestamp: now,
+    direction: args.direction,
+    phoneNumberId: "qr-linked",
+  };
+  if (args.remoteJid) $set.remoteJid = args.remoteJid;
+  if (args.remoteJidAlt) $set.remoteJidAlt = args.remoteJidAlt;
+  if (args.mediaKind && args.qrMediaRelPath) {
+    $set.mediaKind = args.mediaKind;
+    $set.mediaMime = args.mediaMime ?? "application/octet-stream";
+    $set.qrMediaRelPath = args.qrMediaRelPath;
+  }
+
+  try {
+    await messagesCol.updateOne({ userId: uid, waMessageId: args.waMessageId }, { $set }, { upsert: true });
+  } catch (e) {
+    console.error("[wa-qr] persist message DB update failed:", e);
+  }
 
   const initialInterest = args.direction === "in" ? 35 : 10;
 
@@ -334,7 +360,7 @@ async function persistIncomingOrOutgoingMessage(args: {
       const st = await getOrCreateSettings(db, uid);
       await syncAutoFollowupQueueFromLead(db, uid, insertedLead, st).catch(() => {});
     }
-    await refreshLeadInterestScoreFromWaThread(db, uid, args.from, normalizedPhone).catch(() => {});
+    await refreshLeadInterestScoreFromWaThread(db, uid, fromKey, normalizedPhone).catch(() => {});
     return;
   }
 
@@ -359,7 +385,7 @@ async function persistIncomingOrOutgoingMessage(args: {
     const st = await getOrCreateSettings(db, uid);
     await syncAutoFollowupQueueFromLead(db, uid, leadFresh, st).catch(() => {});
   }
-  await refreshLeadInterestScoreFromWaThread(db, uid, args.from, normalizedPhone).catch(() => {});
+  await refreshLeadInterestScoreFromWaThread(db, uid, fromKey, normalizedPhone).catch(() => {});
 }
 
 function parseMessageTimestamp(input: unknown): Date | undefined {
@@ -393,18 +419,54 @@ async function persistBaileysMessage(
     messageTimestamp?: unknown;
   }
 ) {
+  if (isBaileysNonDirectThreadJid(msg.key?.remoteJid)) return;
+
+  const userIdHex = userId.toHexString();
   const phone = bestPhoneLocalPartFromBaileysKey(msg.key ?? {});
   if (!phone) return;
 
   let text = extractText(msg.message);
-  if (!text) {
-    text = inferMediaPlaceholder(msg.message) ?? "";
-  }
-  if (!text) return;
+  const placeholder = inferMediaPlaceholder(msg.message);
+  if (!text) text = placeholder ?? "";
+
+  const mediaMeta = detectBaileysMediaKind(msg.message);
+  if (!text.trim() && !mediaMeta) return;
+  if (!text.trim() && mediaMeta) text = placeholder ?? "[Media]";
 
   const waMessageId = msg.key?.id ?? `qr-${Date.now()}-${Math.random()}`;
   const direction = msg.key?.fromMe ? "out" : "in";
   const timestamp = parseMessageTimestamp(msg.messageTimestamp);
+
+  let mediaKind: WaMessage["mediaKind"] | undefined;
+  let mediaMime: string | undefined;
+  let qrMediaRelPath: string | undefined;
+
+  if (mediaMeta) {
+    try {
+      const { downloadMediaMessage } = await import("@whiskeysockets/baileys");
+      const buffer = (await downloadMediaMessage(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        msg as any,
+        "buffer",
+        {}
+      )) as Buffer;
+      if (buffer?.length) {
+        const saved = await saveQrDownloadedMedia({
+          userIdHex,
+          waMessageId,
+          buffer,
+          mimeType: mediaMeta.mime,
+        });
+        if (saved) {
+          mediaKind = mediaMeta.kind;
+          mediaMime = mediaMeta.mime;
+          qrMediaRelPath = saved.qrMediaRelPath;
+        }
+      }
+    } catch (err) {
+      console.warn("[wa-qr] media download for inbox failed:", err);
+    }
+  }
 
   await persistIncomingOrOutgoingMessage({
     userId,
@@ -416,6 +478,9 @@ async function persistBaileysMessage(
     text,
     direction,
     timestamp,
+    ...(mediaKind && qrMediaRelPath
+      ? { mediaKind, mediaMime, qrMediaRelPath }
+      : {}),
   });
 }
 
@@ -428,14 +493,16 @@ async function processQrInboundAutoReply(args: {
   senderName: string;
   text: string;
 }) {
+  const authDirEarly = getWaAuthDir(args.userIdHex);
+  const from = await canonicalQrThreadFromLocalPart(authDirEarly, args.from);
   const store = getStore(args.userIdHex);
   const uid = args.userId;
-  const inboundId = args.inboundMessageId ?? `${args.from}:${normalizeTextForKey(args.text)}`;
+  const inboundId = args.inboundMessageId ?? `${from}:${normalizeTextForKey(args.text)}`;
   if (store.processedInboundIds.has(inboundId) || store.inflightInboundIds.has(inboundId)) {
     return;
   }
   const now = Date.now();
-  const lastReplyAt = store.recentReplyByPhone.get(args.from) ?? 0;
+  const lastReplyAt = store.recentReplyByPhone.get(from) ?? 0;
   // Defensive throttle to prevent duplicate reply bursts from repeated upsert events.
   if (now - lastReplyAt < 12_000) {
     return;
@@ -448,22 +515,27 @@ async function processQrInboundAutoReply(args: {
       store.processedInboundIds.add(inboundId);
       return;
     }
-    if (isAutoReplySuppressedAfterManualSend(settings)) {
+    if (isAutoReplySuppressedAfterManualSend(settings, from)) {
       store.processedInboundIds.add(inboundId);
       return;
     }
-    if (await isAutoReplyExcludedForQrInbound(settings, args.from, getWaAuthDir(args.userIdHex))) {
+    if (await isAutoReplyExcludedForQrInbound(settings, from, getWaAuthDir(args.userIdHex))) {
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
+    if (shouldSkipAutoReplyForInboundText(args.text)) {
       store.processedInboundIds.add(inboundId);
       return;
     }
 
     const messagesCol = waMessagesCollection(db);
     const leadsCol = leadsCollection(db);
+    const threadFilter = mongoMatchStoredWaFromForUser(uid, from);
     // Burst guard: wait briefly so back-to-back user messages collapse into one latest reply.
     await sleep(1800);
     if (args.inboundMessageId) {
       const latestInbound = await messagesCol
-        .find({ userId: uid, from: args.from, direction: "in" })
+        .find({ ...threadFilter, direction: "in" })
         .sort({ timestamp: -1 })
         .limit(1)
         .toArray();
@@ -473,8 +545,7 @@ async function processQrInboundAutoReply(args: {
       }
       if (latestInbound[0]) {
         const alreadyReplied = await messagesCol.findOne({
-          userId: uid,
-          from: args.from,
+          ...threadFilter,
           direction: "out",
           timestamp: { $gte: latestInbound[0].timestamp },
         });
@@ -484,7 +555,7 @@ async function processQrInboundAutoReply(args: {
         }
       }
     }
-    const normalizedPhone = normalizePhone(args.from);
+    const normalizedPhone = normalizePhone(from);
     const lead = await leadsCol.findOne({ userId: uid, phone: normalizedPhone });
     if (lead?.needsHuman) {
       await leadsCol.updateOne(
@@ -502,7 +573,7 @@ async function processQrInboundAutoReply(args: {
     }
 
     const recent = await messagesCol
-      .find({ userId: uid, from: args.from })
+      .find(threadFilter)
       .sort({ timestamp: -1 })
       .limit(20)
       .toArray();
@@ -560,7 +631,7 @@ async function processQrInboundAutoReply(args: {
     await persistIncomingOrOutgoingMessage({
       userId: uid,
       waMessageId: sent.messageId,
-      from: args.from,
+      from,
       senderName: "SATYAM AI",
       text: safeReplyText,
       direction: "out",
@@ -571,8 +642,7 @@ async function processQrInboundAutoReply(args: {
     // but only if we haven't already sent it to this contact before.
     if (reply.sharedCatalogue && settings.autoShareCatalogue) {
       const alreadySentPdf = await messagesCol.findOne({
-        userId: uid,
-        from: args.from,
+        ...threadFilter,
         direction: "out",
         text: "[AgriBird Catalogue PDF]",
       });
@@ -582,7 +652,7 @@ async function processQrInboundAutoReply(args: {
           await persistIncomingOrOutgoingMessage({
             userId: uid,
             waMessageId: catResult.messageId,
-            from: args.from,
+            from,
             senderName: "SATYAM AI",
             text: "[AgriBird Catalogue PDF]",
             direction: "out",
@@ -594,7 +664,7 @@ async function processQrInboundAutoReply(args: {
       }
     }
 
-    store.recentReplyByPhone.set(args.from, Date.now());
+    store.recentReplyByPhone.set(from, Date.now());
     store.processedInboundIds.add(inboundId);
   } finally {
     store.inflightInboundIds.delete(inboundId);
@@ -621,15 +691,18 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
     if (store.processedInboundIds.has(inboundId) || store.inflightInboundIds.has(inboundId)) continue;
     store.inflightInboundIds.add(inboundId);
     try {
-      const lastReplyAt = store.recentReplyByPhone.get(msg.from) ?? 0;
+      const authDirSweep = getWaAuthDir(userIdHex);
+      const threadCanon = await canonicalQrThreadFromLocalPart(authDirSweep, msg.from);
+      const threadFilter = mongoMatchStoredWaFromForUser(userId, threadCanon);
+
+      const lastReplyAt = store.recentReplyByPhone.get(threadCanon) ?? 0;
       // Keep generation idempotent during rapid upserts / overlapping sweeps.
       if (Date.now() - lastReplyAt < 12_000) {
         continue;
       }
 
       const hasOutbound = await messagesCol.findOne({
-        userId,
-        from: msg.from,
+        ...threadFilter,
         direction: "out",
         _id: { $gt: msg._id },
       });
@@ -639,8 +712,7 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
       }
 
       const newerInbound = await messagesCol.findOne({
-        userId,
-        from: msg.from,
+        ...threadFilter,
         direction: "in",
         timestamp: { $gt: msg.timestamp },
       });
@@ -654,21 +726,20 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
         store.processedInboundIds.add(inboundId);
         continue;
       }
-      if (isAutoReplySuppressedAfterManualSend(settings)) {
+      if (isAutoReplySuppressedAfterManualSend(settings, threadCanon)) {
         store.processedInboundIds.add(inboundId);
         continue;
       }
-      const fromForExclusion =
-        bestPhoneLocalPartFromBaileysKey({
-          remoteJid: msg.remoteJid,
-          remoteJidAlt: msg.remoteJidAlt,
-        }) ?? msg.from;
-      if (await isAutoReplyExcludedForQrInbound(settings, fromForExclusion, getWaAuthDir(userIdHex))) {
+      if (await isAutoReplyExcludedForQrInbound(settings, threadCanon, authDirSweep)) {
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
+      if (shouldSkipAutoReplyForInboundStoredMessage(msg)) {
         store.processedInboundIds.add(inboundId);
         continue;
       }
 
-      const normalized = normalizePhone(msg.from);
+      const normalized = normalizePhone(threadCanon);
       const lead = await leadsCol.findOne({ userId, phone: normalized });
       if (lead?.needsHuman) {
         await leadsCol.updateOne(
@@ -686,7 +757,7 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
       }
 
       const recent = await messagesCol
-        .find({ userId, from: msg.from })
+        .find(threadFilter)
         .sort({ timestamp: -1 })
         .limit(20)
         .toArray();
@@ -733,7 +804,7 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
           replaced: safeReplyText,
         });
       }
-      const sent = await sendQrTextMessage(userIdHex, msg.from, safeReplyText);
+      const sent = await sendQrTextMessage(userIdHex, threadCanon, safeReplyText);
       if (!sent.ok) {
         console.error("[wa-qr] sweep send failed:", sent.error);
         continue;
@@ -742,7 +813,7 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
       await persistIncomingOrOutgoingMessage({
         userId,
         waMessageId: sent.messageId,
-        from: msg.from,
+        from: threadCanon,
         senderName: "SATYAM AI",
         text: safeReplyText,
         direction: "out",
@@ -753,18 +824,17 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
       // but only if it hasn't already been sent to this contact before.
       if (reply.sharedCatalogue && settings.autoShareCatalogue) {
         const alreadySentPdf = await messagesCol.findOne({
-          userId,
-          from: msg.from,
+          ...threadFilter,
           direction: "out",
           text: "[AgriBird Catalogue PDF]",
         });
         if (!alreadySentPdf) {
-          const catResult = await sendQrCatalogue(userIdHex, msg.from);
+          const catResult = await sendQrCatalogue(userIdHex, threadCanon);
           if (catResult.ok) {
             await persistIncomingOrOutgoingMessage({
               userId,
               waMessageId: catResult.messageId,
-              from: msg.from,
+              from: threadCanon,
               senderName: "SATYAM AI",
               text: "[AgriBird Catalogue PDF]",
               direction: "out",
@@ -776,7 +846,7 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
         }
       }
 
-      store.recentReplyByPhone.set(msg.from, Date.now());
+      store.recentReplyByPhone.set(threadCanon, Date.now());
       store.processedInboundIds.add(inboundId);
     } finally {
       store.inflightInboundIds.delete(inboundId);
@@ -940,6 +1010,8 @@ export async function startQrConnection(userIdHex: string, forceRestart = false)
           }
 
           const jid = msg.key?.remoteJid ?? "";
+          if (isBaileysNonDirectThreadJid(jid)) continue;
+
           const from = bestPhoneLocalPartFromBaileysKey(msg.key ?? {});
           if (!from) continue;
 
@@ -974,6 +1046,7 @@ export async function startQrConnection(userIdHex: string, forceRestart = false)
 
           const text = extractText(msg.message);
           if (!text) continue;
+          if (detectBaileysMediaKind(msg.message)) continue;
           if (!isRecentInbound(ts)) continue;
 
           const inboundMessageId = msg.key?.id ?? undefined;

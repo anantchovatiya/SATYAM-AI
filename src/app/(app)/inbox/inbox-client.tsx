@@ -151,7 +151,10 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       msg.text === "[Video]" ||
       msg.text === "[Document]" ||
       msg.text === "[Sticker]" ||
-      msg.text === "[Voice message]");
+      msg.text === "[Voice message]" ||
+      (isOut &&
+        ((msg.mediaKind === "image" && msg.text.trimStart().startsWith("📷")) ||
+          (msg.mediaKind === "document" && msg.text.trimStart().startsWith("📄")))));
 
   return (
     <div className={cn("flex items-end gap-2", isOut ? "flex-row-reverse" : "flex-row")}>

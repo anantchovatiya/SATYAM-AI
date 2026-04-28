@@ -1,9 +1,11 @@
+import { readFile } from "node:fs/promises";
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
 import { fetchCloudMediaBinary, resolveWhatsAppRuntimeConfig } from "@/lib/whatsapp";
 import { requireApiUser } from "@/lib/auth/session";
+import { resolveQrMediaAbsolutePath } from "@/lib/wa-qr-media-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -22,7 +24,31 @@ export async function GET(req: NextRequest) {
       userId: auth.userId,
       waMessageId,
     });
-    if (!doc?.mediaWaId) {
+    if (!doc) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
+    if (doc.qrMediaRelPath) {
+      const abs = resolveQrMediaAbsolutePath(doc.qrMediaRelPath, auth.userId.toHexString());
+      if (!abs) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+      }
+      try {
+        const buf = await readFile(abs);
+        const contentType = doc.mediaMime?.trim() || "application/octet-stream";
+        return new NextResponse(new Uint8Array(buf), {
+          status: 200,
+          headers: {
+            "Content-Type": contentType,
+            "Cache-Control": "private, no-store, max-age=0",
+          },
+        });
+      } catch {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+      }
+    }
+
+    if (!doc.mediaWaId) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 

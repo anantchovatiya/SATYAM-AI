@@ -1,5 +1,6 @@
 import { ObjectId, type Collection, type Db } from "mongodb";
 import { normalizeAutoReplyExcludedPhones } from "@/lib/auto-reply-exclusions";
+import { pruneExpiredAutoReplyContactSuppressions } from "@/lib/auto-reply-suppression-map";
 
 export type AiTone = "sales" | "friendly" | "professional" | "premium";
 
@@ -25,11 +26,16 @@ export interface AutomationSettings {
   autoReply: boolean;
   /**
    * How long to pause AI auto-reply after you send a message from the inbox (0 = do not pause).
-   * Each manual send extends the window. Stored end time: `autoReplySuppressedUntil`.
+   * Each manual send extends the window for that contact only. End times: `autoReplySuppressedUntilByContact`.
    */
   autoReplyPauseAfterManualMinutes: number;
-  /** Set server-side when you send from the app; auto-reply skips until this time. */
+  /** @deprecated Legacy global pause; migrated away — use `autoReplySuppressedUntilByContact`. */
   autoReplySuppressedUntil?: Date;
+  /**
+   * Per-contact auto-reply pause after manual inbox send. Keys: `canonicalWaContactKey` digits.
+   * Values: UTC instant until which auto-reply is suppressed for that contact.
+   */
+  autoReplySuppressedUntilByContact?: Record<string, Date>;
   /**
    * Canonical phone digits (`canonicalWaContactKey`); no AI auto-reply for these contacts.
    * Example: 919876543210
@@ -77,12 +83,23 @@ export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id" | "userId"> = {
 };
 
 /** Safe to pass from Server Components → client (no `ObjectId` / BSON types). */
-export type AutomationSettingsClient = Omit<AutomationSettings, "_id" | "userId">;
+export type AutomationSettingsClient = Omit<
+  AutomationSettings,
+  "_id" | "userId" | "autoReplySuppressedUntil" | "autoReplySuppressedUntilByContact"
+>;
 
 export function stripSettingsForClient(doc: AutomationSettings): AutomationSettingsClient {
-  const { _id, userId, ...rest } = doc;
+  const {
+    _id,
+    userId,
+    autoReplySuppressedUntil,
+    autoReplySuppressedUntilByContact,
+    ...rest
+  } = doc;
   void _id;
   void userId;
+  void autoReplySuppressedUntil;
+  void autoReplySuppressedUntilByContact;
   return rest;
 }
 
@@ -113,6 +130,9 @@ export async function getOrCreateSettings(db: Db, userId: ObjectId): Promise<Aut
         typeof doc.languageMirrorMode === "boolean"
           ? doc.languageMirrorMode
           : DEFAULT_SETTINGS.languageMirrorMode,
+      autoReplySuppressedUntilByContact: pruneExpiredAutoReplyContactSuppressions(
+        doc.autoReplySuppressedUntilByContact
+      ),
     };
   }
 

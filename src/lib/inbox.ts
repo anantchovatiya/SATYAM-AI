@@ -69,9 +69,14 @@ export async function getInboxContacts(userId: ObjectId, limitMessages = 1500): 
       Boolean(m.mediaWaId && m.mediaKind) &&
       m.phoneNumberId !== "qr-linked";
 
-    const mediaSrc = hasCloudInboundMedia
-      ? `/api/inbox/media?waMessageId=${encodeURIComponent(m.waMessageId)}`
-      : undefined;
+    const hasQrStoredMedia =
+      m.phoneNumberId === "qr-linked" &&
+      Boolean(m.mediaKind && m.qrMediaRelPath);
+
+    const mediaSrc =
+      hasCloudInboundMedia || hasQrStoredMedia
+        ? `/api/inbox/media?waMessageId=${encodeURIComponent(m.waMessageId)}`
+        : undefined;
 
     msgByPhone[key].push({
       id: m.waMessageId,

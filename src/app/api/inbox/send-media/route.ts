@@ -16,6 +16,7 @@ import {
   formatLeadPhoneFromRaw,
 } from "@/lib/wa-phone";
 import { resolveQrRecipient } from "@/lib/wa-qr-recipient";
+import { saveQrDownloadedMedia } from "@/lib/wa-qr-media-storage";
 import {
   getQrSnapshot,
   sendQrDocumentBuffer,
@@ -148,20 +149,40 @@ export async function POST(req: NextRequest) {
     const phoneNumberId =
       channel === "qr" ? "qr-linked" : waConfig?.phoneNumberId ?? "api";
 
+    let qrMediaRelPath: string | undefined;
+    let qrMediaKind: "image" | "document" | undefined;
+    if (channel === "qr") {
+      const saved = await saveQrDownloadedMedia({
+        userIdHex,
+        waMessageId: sendResult.messageId,
+        buffer: buf,
+        mimeType: mime,
+      });
+      if (saved) {
+        qrMediaRelPath = saved.qrMediaRelPath;
+        qrMediaKind = isImg ? "image" : "document";
+      }
+    }
+
+    const msgSet: Record<string, unknown> = {
+      userId,
+      waMessageId: sendResult.messageId,
+      from: fromKey,
+      senderName: "SATYAM AI",
+      text: displayText,
+      timestamp: now,
+      direction: "out",
+      phoneNumberId,
+    };
+    if (qrMediaRelPath && qrMediaKind) {
+      msgSet.mediaKind = qrMediaKind;
+      msgSet.mediaMime = mime;
+      msgSet.qrMediaRelPath = qrMediaRelPath;
+    }
+
     await messagesCol.updateOne(
       { userId, waMessageId: sendResult.messageId },
-      {
-        $setOnInsert: {
-          userId,
-          waMessageId: sendResult.messageId,
-          from: fromKey,
-          senderName: "SATYAM AI",
-          text: displayText,
-          timestamp: now,
-          direction: "out",
-          phoneNumberId,
-        },
-      },
+      { $set: msgSet },
       { upsert: true }
     );
 
@@ -215,7 +236,8 @@ export async function POST(req: NextRequest) {
     await applyManualSendAutoReplySuppression(
       db,
       userId,
-      settings.autoReplyPauseAfterManualMinutes
+      settings.autoReplyPauseAfterManualMinutes,
+      fromKey
     ).catch(() => {});
 
     return NextResponse.json({

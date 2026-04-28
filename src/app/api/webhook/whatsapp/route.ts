@@ -21,8 +21,12 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { ObjectId, type Db } from "mongodb";
+import { shouldSkipAutoReplyForInboundStoredMessage } from "@/lib/auto-reply-skip-media";
 import { isPhoneExcludedFromAutoReply } from "@/lib/auto-reply-exclusions";
-import { isAutoReplySuppressedAfterManualSend } from "@/lib/auto-reply-pause";
+import {
+  autoReplySuppressionResumeAtIso,
+  isAutoReplySuppressedAfterManualSend,
+} from "@/lib/auto-reply-pause";
 import { getDb }               from "@/lib/mongodb";
 import { leadsCollection }     from "@/lib/models/lead";
 import {
@@ -421,16 +425,29 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }
-  if (isAutoReplySuppressedAfterManualSend(settings)) {
+  if (isAutoReplySuppressedAfterManualSend(settings, msg.from)) {
     addEvent("reply_skipped", {
-      reason: "autoReply paused after manual send from inbox",
-      resumeAt: settings.autoReplySuppressedUntil?.toISOString?.() ?? null,
+      reason: "autoReply paused after manual send from inbox (this contact only)",
+      resumeAt: autoReplySuppressionResumeAtIso(settings, msg.from),
     });
     await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }
   if (isPhoneExcludedFromAutoReply(settings, msg.from)) {
     addEvent("reply_skipped", { reason: "autoReply excluded for this contact in settings" });
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
+    return { leadId, status: "skipped" };
+  }
+  if (
+    shouldSkipAutoReplyForInboundStoredMessage({
+      text: msg.text,
+      mediaKind: msg.mediaKind,
+      mediaWaId: msg.mediaWaId,
+    })
+  ) {
+    addEvent("reply_skipped", {
+      reason: "Inbound is image/media or placeholder text; auto-reply skipped (nothing visible to AI)",
+    });
     await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
     return { leadId, status: "skipped" };
   }

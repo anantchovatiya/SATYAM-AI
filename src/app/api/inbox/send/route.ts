@@ -153,7 +153,8 @@ export async function POST(req: NextRequest) {
     await applyManualSendAutoReplySuppression(
       db,
       userId,
-      settings.autoReplyPauseAfterManualMinutes
+      settings.autoReplyPauseAfterManualMinutes,
+      fromKey
     ).catch(() => {});
 
     const targetUsed = channel === "qr" ? qrTarget : to;

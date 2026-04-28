@@ -24,6 +24,10 @@
 .DS_Store
 *.pem
 
+# WhatsApp QR session + downloaded media (local dev)
+.wa-auth
+.wa-media
+
 # debug
 npm-debug.log*
 yarn-debug.log*

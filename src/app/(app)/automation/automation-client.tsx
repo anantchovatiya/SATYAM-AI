@@ -254,12 +254,6 @@ function UnsavedDot() {
   return <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" title="Unsaved changes" />;
 }
 
-function parseSettingsDate(d: Date | string | undefined): Date | null {
-  if (d == null) return null;
-  const t = d instanceof Date ? d : new Date(d);
-  return Number.isNaN(t.getTime()) ? null : t;
-}
-
 // ── Main component ─────────────────────────────────────────────────────────────
 export function AutomationClient({
   initial,
@@ -363,8 +357,9 @@ export function AutomationClient({
               Pause after I send (inbox)
             </div>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              When you send a message or attachment from the inbox, AI auto-reply pauses for the minutes below.
-              Each send extends the pause. Set to <strong>0</strong> to keep auto-reply running (no pause).
+              When you send a message or attachment from the inbox, AI auto-reply pauses for{" "}
+              <strong>that chat only</strong> for the minutes below. Other chats keep auto-reply as normal.
+              Each send to the same contact extends its pause. Set to <strong>0</strong> to disable this pause.
             </p>
             <div className="flex flex-wrap items-center gap-2">
               <input
@@ -379,19 +374,6 @@ export function AutomationClient({
               />
               <span className="text-sm text-slate-600 dark:text-slate-300">minutes</span>
             </div>
-            {(() => {
-              const end = parseSettingsDate(form.autoReplySuppressedUntil);
-              if (!end || end.getTime() <= Date.now()) return null;
-              return (
-                <p className="text-xs text-amber-800 dark:text-amber-200/90">
-                  Auto-reply is paused from a recent manual send until{" "}
-                  <strong>
-                    {end.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
-                  </strong>{" "}
-                  (refresh the page to update).
-                </p>
-              );
-            })()}
           </div>
           <div className="ml-0 space-y-2 rounded-xl border border-slate-100 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-800/30">
             <div className="flex items-center gap-2 text-sm font-medium text-slate-800 dark:text-slate-200">

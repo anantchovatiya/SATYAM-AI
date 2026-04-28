@@ -32,6 +32,27 @@ export async function resolvePnFromLidReverseMappingFile(
   return readJsonStringFile(path.join(authDir, `lid-mapping-${c}_reverse.json`));
 }
 
+/**
+ * Stable thread key for QR inbox + leads: prefer MSISDN from LID reverse mapping so inbound/outbound
+ * and Baileys `fromMe` events all share one `whatsapp_messages.from` bucket.
+ */
+export async function canonicalQrThreadFromLocalPart(
+  authDir: string | null,
+  localPart: string
+): Promise<string> {
+  const raw = String(localPart ?? "").trim();
+  if (!raw) return raw;
+  if (authDir) {
+    const pn = await resolvePnFromLidReverseMappingFile(authDir, raw);
+    if (pn) {
+      const canon = canonicalWaContactKey(pn);
+      if (canon) return canon;
+    }
+  }
+  const c = canonicalWaContactKey(raw);
+  return c || raw;
+}
+
 export async function resolveLidFromPnForwardMappingFile(
   authDir: string,
   canonicalPn: string
