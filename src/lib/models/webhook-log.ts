@@ -27,6 +27,8 @@ export interface WaMessage {
   waMessageId: string;   // Meta message ID (unique)
   from: string;          // sender phone e.g. "919810011223"
   remoteJid?: string;    // exact WhatsApp chat JID, e.g. "12345@lid"
+  /** Baileys: paired PN JID when `remoteJid` is @lid (for resolving MSISDN). */
+  remoteJidAlt?: string;
   senderName?: string;
   text: string;
   timestamp: Date;

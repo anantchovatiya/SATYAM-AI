@@ -4,7 +4,7 @@ import { Boom } from "@hapi/boom";
 import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { leadsCollection } from "@/lib/models/lead";
-import { isPhoneExcludedFromAutoReply } from "@/lib/auto-reply-exclusions";
+import { isAutoReplyExcludedForQrInbound } from "@/lib/wa-qr-lid-mapping";
 import { isAutoReplySuppressedAfterManualSend } from "@/lib/auto-reply-pause";
 import { getOrCreateSettings } from "@/lib/models/settings";
 import { waMessagesCollection } from "@/lib/models/webhook-log";
@@ -13,6 +13,7 @@ import { analyzeChat, generateReply, type AnalyzeResult } from "@/lib/ai";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
+import { bestPhoneLocalPartFromBaileysKey } from "@/lib/wa-phone";
 /** Gemini Vision on inbound images — costs API. Set `true` to re-enable business-card scan + Excel. */
 const ENABLE_BUSINESS_CARD_IMAGE_SCAN = false;
 
@@ -260,6 +261,7 @@ async function persistIncomingOrOutgoingMessage(args: {
   waMessageId: string;
   from: string;
   remoteJid?: string;
+  remoteJidAlt?: string;
   senderName?: string;
   text: string;
   direction: "in" | "out";
@@ -295,6 +297,7 @@ async function persistIncomingOrOutgoingMessage(args: {
           waMessageId: args.waMessageId,
           from: args.from,
           remoteJid: args.remoteJid,
+          ...(args.remoteJidAlt ? { remoteJidAlt: args.remoteJidAlt } : {}),
           senderName: args.senderName ?? normalizedPhone,
           text: args.text,
           timestamp: now,
@@ -359,15 +362,6 @@ async function persistIncomingOrOutgoingMessage(args: {
   await refreshLeadInterestScoreFromWaThread(db, uid, args.from, normalizedPhone).catch(() => {});
 }
 
-function extractPhoneFromJid(jid?: string | null): string | null {
-  if (!jid) return null;
-  if (jid === "status@broadcast") return null;
-  if (!jid.includes("@")) return null;
-  const [phone] = jid.split("@");
-  if (!phone || phone.length < 5) return null;
-  return phone;
-}
-
 function parseMessageTimestamp(input: unknown): Date | undefined {
   if (typeof input === "number") {
     return new Date(input * 1000);
@@ -393,13 +387,13 @@ function isRecentInbound(ts?: Date): boolean {
 async function persistBaileysMessage(
   userId: ObjectId,
   msg: {
-    key?: { id?: string; remoteJid?: string; fromMe?: boolean };
+    key?: { id?: string; remoteJid?: string; remoteJidAlt?: string; fromMe?: boolean };
     message?: unknown;
     pushName?: string;
     messageTimestamp?: unknown;
   }
 ) {
-  const phone = extractPhoneFromJid(msg.key?.remoteJid);
+  const phone = bestPhoneLocalPartFromBaileysKey(msg.key ?? {});
   if (!phone) return;
 
   let text = extractText(msg.message);
@@ -417,6 +411,7 @@ async function persistBaileysMessage(
     waMessageId,
     from: phone,
     remoteJid: msg.key?.remoteJid,
+    remoteJidAlt: msg.key?.remoteJidAlt,
     senderName: msg.pushName || phone,
     text,
     direction,
@@ -457,7 +452,7 @@ async function processQrInboundAutoReply(args: {
       store.processedInboundIds.add(inboundId);
       return;
     }
-    if (isPhoneExcludedFromAutoReply(settings, args.from)) {
+    if (await isAutoReplyExcludedForQrInbound(settings, args.from, getWaAuthDir(args.userIdHex))) {
       store.processedInboundIds.add(inboundId);
       return;
     }
@@ -663,7 +658,12 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
         store.processedInboundIds.add(inboundId);
         continue;
       }
-      if (isPhoneExcludedFromAutoReply(settings, msg.from)) {
+      const fromForExclusion =
+        bestPhoneLocalPartFromBaileysKey({
+          remoteJid: msg.remoteJid,
+          remoteJidAlt: msg.remoteJidAlt,
+        }) ?? msg.from;
+      if (await isAutoReplyExcludedForQrInbound(settings, fromForExclusion, getWaAuthDir(userIdHex))) {
         store.processedInboundIds.add(inboundId);
         continue;
       }
@@ -940,7 +940,7 @@ export async function startQrConnection(userIdHex: string, forceRestart = false)
           }
 
           const jid = msg.key?.remoteJid ?? "";
-          const from = extractPhoneFromJid(jid);
+          const from = bestPhoneLocalPartFromBaileysKey(msg.key ?? {});
           if (!from) continue;
 
           // ── Image: persist to inbox, then optional business-card scan ───────

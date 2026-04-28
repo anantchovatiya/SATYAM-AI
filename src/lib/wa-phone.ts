@@ -9,6 +9,43 @@ export function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function waJidLocalPart(jid?: string | null): string | null {
+  if (!jid) return null;
+  if (jid === "status@broadcast") return null;
+  if (!jid.includes("@")) return null;
+  const [local] = jid.split("@");
+  if (!local || local.length < 5) return null;
+  return local;
+}
+
+/**
+ * Prefer the MSISDN local part from @s.whatsapp.net / @c.us when the primary JID is @lid
+ * (Baileys `remoteJid` / `remoteJidAlt`). Same value we store in `whatsapp_messages.from` for QR chats.
+ */
+export function bestPhoneLocalPartFromBaileysKey(key: {
+  remoteJid?: string | null;
+  remoteJidAlt?: string | null;
+}): string | null {
+  const jids = [key.remoteJid, key.remoteJidAlt].filter(
+    (j): j is string => typeof j === "string" && j.length > 0
+  );
+  if (jids.length === 0) return null;
+  for (const j of jids) {
+    const lower = j.toLowerCase();
+    if (lower.endsWith("@s.whatsapp.net") || lower.endsWith("@c.us")) {
+      const p = waJidLocalPart(j);
+      if (p) return p;
+    }
+  }
+  for (const j of jids) {
+    if (j.toLowerCase().endsWith("@lid")) {
+      const p = waJidLocalPart(j);
+      if (p) return p;
+    }
+  }
+  return waJidLocalPart(jids[0]);
+}
+
 export function canonicalWaContactKey(raw: string): string {
   let s = String(raw).trim();
   if (s.includes("@")) s = s.split("@")[0] ?? s;

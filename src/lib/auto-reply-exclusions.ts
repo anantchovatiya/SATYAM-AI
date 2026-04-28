@@ -3,6 +3,18 @@ import type { AutomationSettings } from "@/lib/models/settings";
 
 const MAX_EXCLUDED = 500;
 
+/** Digit keys that should match the same excluded contact (e.g. Indian 91XXXXXXXXXX vs national 10 digits). */
+function exclusionMatchVariantSet(canonicalDigits: string): Set<string> {
+  const s = new Set<string>();
+  const c = canonicalWaContactKey(canonicalDigits);
+  if (!c) return s;
+  s.add(c);
+  if (c.length === 12 && c.startsWith("91")) {
+    s.add(c.slice(2));
+  }
+  return s;
+}
+
 /**
  * Deduplicate, canonicalize, cap count (matches inbound `from` via `canonicalWaContactKey`).
  */
@@ -21,5 +33,14 @@ export function isPhoneExcludedFromAutoReply(settings: AutomationSettings, rawFr
   if (!Array.isArray(list) || list.length === 0) return false;
   const c = canonicalWaContactKey(rawFrom);
   if (!c) return false;
-  return list.includes(c);
+  const inbound = exclusionMatchVariantSet(c);
+  for (const ex of list) {
+    const exCanon = canonicalWaContactKey(ex);
+    if (!exCanon) continue;
+    const exSet = exclusionMatchVariantSet(exCanon);
+    for (const k of inbound) {
+      if (exSet.has(k)) return true;
+    }
+  }
+  return false;
 }
