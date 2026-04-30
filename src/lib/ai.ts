@@ -204,6 +204,14 @@ function buildAddressingInstruction(): string {
   return `ADDRESSING: Prefer "Sir" (or "Ma'am" only if the name or context clearly suggests). Do NOT use the lead's personal name in the message — it is for your context only. Never open with "Hi [Name]" or repeat their name; "Sir" is enough.`;
 }
 
+/** B2B sales rules: do not over-promise delivery or waive KYC / payment terms. */
+function buildCommerceGuardrails(): string {
+  return `COMMERCE GUARDRAILS (non-negotiable — follow even if the customer pushes back):
+- GST / tax ID: If the customer says they have no GST, cannot provide GST, or ask to skip it, do NOT say it is optional or "no problem". Politely explain that for proper billing and compliance a valid GSTIN OR a valid PAN (as per your company rule) is required — offer PAN if they have no GST, and keep tone helpful but firm. Never suggest doing business without any tax identity when they raised the issue.
+- Payments: Standard terms are advance payment before dispatch. If they refuse advance, want only credit/udhaar, COD-only, or "pay after delivery" without your approval — do NOT agree or say "that's ok / theek hai / no issue". Politely clarify you do not operate on open credit; advance (or your standard policy) is required to process the order. Stay respectful.
+- Delivery timing: Do NOT promise "sending today", "reaching today", "dispatch today", or specific dates/hours unless the knowledge base or an earlier confirmed fact in this chat explicitly states it. Prefer wording like you will confirm dispatch / timeline or arrange dispatch after payment and document details — avoid invented urgency.`;
+}
+
 /**
  * Shown in interest-only mini prompts. Score reflects the last
  * `INTEREST_SCORE_MESSAGE_WINDOW` messages only (both LEAD and AGENT) — not one message, not
@@ -522,6 +530,7 @@ You reply on behalf of Agribird Sales Person as a real team member — NOT a bot
 CRITICAL: NEVER reveal or hint that you are an AI, bot, or automated system. Never say things like "as an AI", "I'm a bot", "connect you with a human", "our team will assist", or "a specialist will follow up". Respond naturally as a knowledgeable sales person.
 ${buildDefaultLanguageInstruction(languageMirrorMode)}
 ${buildAddressingInstruction()}
+${buildCommerceGuardrails()}
 Keep response 2-4 concise sentences.
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
@@ -530,7 +539,7 @@ IMPORTANT: Never copy-paste raw catalogue lines or data codes. Always describe p
 ${restrictToKnowledgeBase ? "Use ONLY the provided business knowledge base as factual source. If the answer is not present, say you will look into it and get back to them shortly." : ""}
 ${shouldIncludeDetails ? "User is asking for product details. Describe the relevant product(s) naturally — include model name, size, key features, and carton/pack quantity if available. Do NOT list raw codes or paste catalogue lines." : ""}
 ${shouldAppendCatalogue ? "The AgriBird product catalogue PDF will be sent to the customer as a separate WhatsApp document right after this message. Do NOT mention any URL or link. Do NOT say 'here is a link' or 'check this link'. Simply acknowledge you are sending the catalogue now (e.g. 'I'm sending you our AgriBird catalogue now! 📄')." : ""}
-${repeatCatalogueRequest ? "IMPORTANT: The catalogue PDF was already sent earlier in this WhatsApp chat — the customer can scroll up to open it again. They are asking to send it again. Politely confirm it is already in the chat above and offer product help. Do NOT say it failed to deliver, did not come through, or was unclear. Do NOT promise to resend the file." : ""}
+${repeatCatalogueRequest ? "IMPORTANT: The catalogue PDF was already sent earlier in this WhatsApp chat — the customer can scroll up to open it again. They are asking to send it again (or for product photos / pictures). Politely confirm it is already in the chat above; the PDF usually includes product images and model range. Offer help on a specific model. Do NOT say it failed to deliver, did not come through, or was unclear. Do NOT promise to resend the file." : ""}
 ${needsHuman ? "The customer needs special attention. Acknowledge their concern warmly and let them know you will look into it and get back to them." : ""}`;
   const contextText = context
     .slice(-8)
@@ -603,12 +612,13 @@ You are replying on behalf of SATYAM AI CRM as a real team member — NOT a bot.
 CRITICAL: NEVER reveal or hint that you are an AI, bot, or automated system. Never say "connect you with a human", "our team will assist", or "a specialist will follow up". Respond naturally as a knowledgeable sales person.
 ${buildDefaultLanguageInstruction(languageMirrorMode)}
 ${buildAddressingInstruction()}
+${buildCommerceGuardrails()}
 Lead's name (context only, do not use in the reply; use Sir): ${leadName}.
 Keep replies concise (2-4 sentences max).
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
 ${shouldAppendCatalogue ? "A catalogue PDF will be sent as a separate WhatsApp document after your reply. Briefly acknowledge that you are sending it now — do not paste raw URLs." : ""}
-${repeatCatalogueRequest ? "IMPORTANT: The catalogue PDF was already sent earlier in this chat — the customer can scroll up to open it. They asked to send it again: confirm it is already above, offer product help. Do NOT say it failed to deliver or promise to resend." : ""}
+${repeatCatalogueRequest ? "IMPORTANT: The catalogue PDF was already sent earlier in this chat — the customer can scroll up to open it again (or for product photos / pictures). Confirm it is above; the PDF includes range images. Offer specific model help. Do NOT say it failed to deliver or promise to resend." : ""}
 ${needsHuman ? "The customer needs special attention. Acknowledge their concern warmly and let them know you will look into it and get back to them." : ""}
 ${attempt === 1 ? "Your previous answer was incomplete. Rewrite from scratch as a complete response." : ""}`,
             },
@@ -840,12 +850,36 @@ function heuristicReply(
   const isFirstReply = outboundCount === 0;
 
   const wantsCatalogue =
-    /\b(catalog|catalogue|brochure|pdf|send.*catalogue|catalogue.*send)\b/.test(lower);
+    /\b(catalog|catalogue|brochure|pdf|send.*catalogue|catalogue.*send)\b/.test(lower) ||
+    customerAsksForProductPhotos(customerMessage);
   const repeatCatRequest =
     catalogueAlreadySentInContext(context) && customerExplicitlyRequestsCatalogue(customerMessage);
 
+  const mentionsNoGstOrPan =
+    /\b(no\s+gst|without\s+gst|don'?t\s+have\s+gst|do\s+not\s+have\s+gst|gst\s+nahi|gst\s+नहीं|gst\s+nahi\s+hai|have\s+no\s+gst|gst\s+available\s+nahi)\b/i.test(
+      lower
+    ) ||
+    /\b(no\s+pan|don'?t\s+have\s+pan|pan\s+nahi|pan\s+नहीं|pan\s+card\s+nahi|without\s+pan)\b/i.test(
+      lower
+    );
+
+  const refusesAdvanceOrWantsCredit =
+    /\b(no\s+advance|not\s+doing\s+advance|won'?t\s+pay\s+advance|without\s+advance|advance\s+nahi|advance\s+नहीं|advance\s+nahi\s+denge|credit\s+only|on\s+credit|udhaar|pure\s+udhaar|cash\s+on\s+delivery|\bcod\s+only\b|pay\s+after\s+delivery|payment\s+after\s+delivery|pehle\s+maal|pehle\s+delivery)\b/i.test(
+      lower
+    );
+
   let reply: string;
-  if (needsHuman) {
+  if (mentionsNoGstOrPan) {
+    reply =
+      language === "Hindi" || language === "Urdu"
+        ? `Sir, billing / compliance ke liye valid GST number ya valid PAN card zaroori hai — bina inme se kisi ek ke process aage nahi badha sakte. Agar aapke paas abhi GST nahi hai lekin PAN hai, to PAN details share kar dijiye; dono nahi ho to pehle arrangement kar lena better hoga.`
+        : `Sir, for proper billing we need a valid GST number or a valid PAN — we can't process orders without one of these on file. If you don't have GST yet but have a PAN, please share it; otherwise we’ll need you to arrange this before we can go ahead.`;
+  } else if (refusesAdvanceOrWantsCredit) {
+    reply =
+      language === "Hindi" || language === "Urdu"
+        ? `Samajh gaya Sir. Hamare yahan dispatch advance payment ke baad hi hota hai — open credit / full udhaar par kaam nahi karte. Advance confirm hone ke baad hi order process karte hain; thoda adjust ho sake to next step bata dijiye.`
+        : `I understand Sir. We work on advance payment before dispatch — we don't do business on open credit. Once advance is confirmed we process the order; if that works for you, share the details and I'll guide the next step.`;
+  } else if (needsHuman) {
     reply = localizedHandoverReply(language, aiTone);
   } else if (wantsCatalogue && repeatCatRequest) {
     reply =
@@ -954,6 +988,35 @@ function stripTrailingDecorativeTokens(value: string): string {
     .trim();
 }
 
+/** Customer wants to see product visuals; catalogue PDF is the right asset (photos, models, range). */
+function customerAsksForProductPhotos(message: string): boolean {
+  const t = message.toLowerCase().trim();
+  if (!/\b(photo|photos|pic|pics|picture|pictures|image|images|snapshot|snapshots|gallery|tasveer)\b/i.test(t)) {
+    return false;
+  }
+  const shareOrView =
+    /\b(send|share|show|forward|attach|give|whatsapp|mail|email|bhej|bhejo|bhejna|dikha|dikhao|dikhaie|dikhaye|chahiye|chahie|manga|mangta|mangte|dekhna|dekho|see|want|need)\b/i.test(
+      t
+    );
+  if (!shareOrView) return false;
+
+  const productish =
+    /\b(gun|guns|spray|sprayer|sprayers|knapsack|pump|pumps|nozzle|tank|hose|product|products|model|models|item|items|equipment|machine|machines|tool|tools|catalog|catalogue|brochure|range|line|variant|variants|size|sizes|type|types|agribird)\b/i.test(
+      t
+    );
+
+  const photoOfSomething =
+    /\b(photo|photos|pic|pics|picture|pictures|image|images)\b[\s\S]{0,24}\bof\b/i.test(t) ||
+    /\bof\b[\s\S]{0,24}\b(photo|photos|pic|pics|picture|pictures|image|images)\b/i.test(t);
+  if (photoOfSomething) {
+    const m = t.match(/\bof\b\s+([a-z0-9_-]+)/i);
+    const junk = /^(me|us|it|you|this|that|here|there|the|a|an|my|your|invoice|bill|receipt)$/i;
+    if (m && !junk.test(m[1] ?? "")) return true;
+  }
+
+  return productish;
+}
+
 /** True if an earlier AGENT message shows we already shared the PDF or discussed the catalogue as already available in the chat. */
 function catalogueAlreadySentInContext(context: IncomingMessage[]): boolean {
   return context
@@ -987,7 +1050,8 @@ function customerExplicitlyRequestsCatalogue(message: string): boolean {
   return (
     /\b(send|share|email|forward|give|whatsapp)\b[\s\S]{0,48}\b(catalog|catalogue|brochure|pdf)\b/.test(t) ||
     /\b(catalog|catalogue|brochure|pdf)\b[\s\S]{0,48}\b(send|share|please|bhej|bhejo)\b/.test(t) ||
-    /\b(send me|share the|share your|mail me)\b[\s\S]{0,32}\b(catalog|catalogue|brochure)\b/.test(t)
+    /\b(send me|share the|share your|mail me)\b[\s\S]{0,32}\b(catalog|catalogue|brochure)\b/.test(t) ||
+    customerAsksForProductPhotos(message)
   );
 }
 
@@ -1003,6 +1067,7 @@ function shouldShareCatalogue(args: {
   if (catalogueAlreadySentInContext(args.context ?? [])) return false;
 
   const text = args.customerMessage.toLowerCase();
+  if (customerAsksForProductPhotos(args.customerMessage)) return true;
   if (/\b(price|pricing|product|catalog|catalogue|brochure|details|spec|feature|model|plan|quote|carton|qty|quantity)\b/.test(text)) {
     return true;
   }
@@ -1032,6 +1097,7 @@ function shouldIncludeCatalogueDetails(args: {
 }): boolean {
   if (!args.productCatalogueInformation.trim()) return false;
   const text = args.customerMessage.toLowerCase();
+  if (customerAsksForProductPhotos(args.customerMessage)) return true;
   if (/\b(details?|spec|specification|price|pricing|carton|qty|quantity|model|feature|catalog|catalogue|brochure)\b/.test(text)) {
     return true;
   }
@@ -1043,7 +1109,9 @@ function isAffirmativeForDetails(message: string, context: IncomingMessage[]): b
   const affirmative = /^(yes|yeah|yep|ok|okay|sure|haan|ha|yes pls|yes please)(\b|$)/.test(text);
   if (!affirmative) return false;
   const recent = context.slice(-6).map((m) => m.text.toLowerCase()).join(" ");
-  return /\b(details?|catalog|catalogue|brochure|price|pricing|spec|carton|qty|quantity|model)\b/.test(recent);
+  return /\b(details?|catalog|catalogue|brochure|price|pricing|spec|carton|qty|quantity|model|photo|photos|pic|pics|picture|pictures|image|images)\b/.test(
+    recent
+  );
 }
 
 function localizedGreetingReply(language: string, aiTone: string): string {

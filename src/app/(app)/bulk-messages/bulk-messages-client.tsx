@@ -375,6 +375,9 @@ export function BulkMessagesClient() {
               Recipients: one <strong>phone per line</strong>, or <code className="rounded bg-violet-100/80 px-1 dark:bg-violet-900/50">phone,name</code>, or{" "}
               <code className="rounded bg-violet-100/80 px-1 dark:bg-violet-900/50">phone,firstname,lastname</code>, or add a final column for company.
             </li>
+            <li>
+              Use <strong>country code + national number</strong> (e.g. <code className="rounded bg-violet-100/80 px-1 dark:bg-violet-900/50">919876543210</code> or a 10-digit Indian mobile so we can normalize to 91…). Each line is sent as its own chat; existing inbox threads are matched automatically so the right WhatsApp identity (LID vs phone) is used.
+            </li>
             <li>Long messages with an image use the image caption (first 1024 chars) plus a follow-up text when needed.</li>
           </ul>
         </div>

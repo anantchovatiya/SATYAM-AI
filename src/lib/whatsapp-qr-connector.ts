@@ -21,7 +21,11 @@ import { analyzeChat, generateReply, type AnalyzeResult } from "@/lib/ai";
 import { refreshLeadInterestScoreFromWaThread } from "@/lib/lead-interest-gemini";
 import { syncAutoFollowupQueueFromLead } from "@/lib/auto-followup-queue";
 import { getEffectiveKnowledge } from "@/lib/knowledge";
-import { bestPhoneLocalPartFromBaileysKey, mongoMatchStoredWaFromForUser } from "@/lib/wa-phone";
+import {
+  bestPhoneLocalPartFromBaileysKey,
+  canonicalWaContactKey,
+  mongoMatchStoredWaFromForUser,
+} from "@/lib/wa-phone";
 import { detectBaileysMediaKind, saveQrDownloadedMedia } from "@/lib/wa-qr-media-storage";
 /** Gemini Vision on inbound images — costs API. Set `true` to re-enable business-card scan + Excel. */
 const ENABLE_BUSINESS_CARD_IMAGE_SCAN = false;
@@ -1338,20 +1342,63 @@ export async function sendQrImageMessage(
 
 function resolveSendJids(to: string): string[] {
   if (!to) return [];
-  if (to.includes("@")) return [to];
-  if (to.includes(":")) {
-    return [`${to}@lid`, `${to}@s.whatsapp.net`];
+  const t = to.trim();
+  if (!t) return [];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  function add(j: string) {
+    const k = j.toLowerCase();
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(j);
+    }
   }
-  const digits = to.replace(/\D/g, "");
+
+  if (t.includes("@")) {
+    add(t);
+    const localPart = t.split("@")[0] ?? "";
+    const lower = t.toLowerCase();
+    if (!localPart.includes(":")) {
+      const d = localPart.replace(/\D/g, "");
+      // MSISDN-shaped local part: try canonical PN JIDs as fallbacks (LID-only sends often need @s.whatsapp.net too).
+      if (d.length >= 10 && d.length <= 12) {
+        const canon = canonicalWaContactKey(localPart);
+        if (canon) {
+          if (!lower.endsWith("@s.whatsapp.net")) add(`${canon}@s.whatsapp.net`);
+          if (!lower.endsWith("@lid")) add(`${canon}@lid`);
+        }
+      }
+    }
+    return out;
+  }
+
+  if (t.includes(":")) {
+    add(`${t}@lid`);
+    add(`${t}@s.whatsapp.net`);
+    return out;
+  }
+
+  const digits = t.replace(/\D/g, "");
   if (!digits) return [];
 
-  // Heuristic: long IDs in history are usually LID identities, not phone MSISDNs.
+  // Heuristic: long IDs are usually LID identities, not phone MSISDNs.
   if (digits.length > 12) {
-    return [`${digits}@lid`, `${digits}@s.whatsapp.net`];
+    add(`${digits}@lid`);
+    add(`${digits}@s.whatsapp.net`);
+    return out;
   }
 
-  // Normal phone-number chats.
-  return [`${digits}@s.whatsapp.net`, `${digits}@lid`];
+  const canon = canonicalWaContactKey(digits) || digits;
+  add(`${canon}@s.whatsapp.net`);
+  add(`${canon}@lid`);
+  if (canon !== digits) {
+    add(`${digits}@s.whatsapp.net`);
+    add(`${digits}@lid`);
+  }
+
+  return out;
 }
 
 function normalizeTextForKey(value: string): string {
