@@ -163,6 +163,7 @@ async function runFollowupAutomation(options: RunOptions, userId: ObjectId) {
       leadName: lead.name,
       daysSinceLastMessage: daysSilent,
       lastMessage: inDoc.text,
+      lastOutboundMessage: outDoc?.text ?? "",
       followUpDelayDays: settings.followUpDelayDays,
       followUpTemplate: settings.followUpTemplate,
       aiTone: settings.aiTone,

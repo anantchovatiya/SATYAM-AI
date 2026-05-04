@@ -117,6 +117,7 @@ export async function sendAutoFollowupForLead(
     leadName: lead.name,
     daysSinceLastMessage: daysForAi,
     lastMessage: inDoc.text,
+    lastOutboundMessage: outDoc?.text ?? "",
     followUpDelayDays: settings.followUpDelayDays,
     followUpTemplate: settings.followUpTemplate,
     aiTone: settings.aiTone,

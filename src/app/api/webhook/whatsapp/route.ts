@@ -481,6 +481,39 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
     autoShareCatalogue: settings.autoShareCatalogue,
     languageMirrorMode: settings.languageMirrorMode,
   });
+
+  if (replyResult.skipOutbound) {
+    addEvent("reply_skipped", {
+      reason: replyResult.escalateAfterOutbound
+        ? "photo_video_demo_handoff_no_auto_reply"
+        : "silent_acknowledgement_no_auto_reply",
+    });
+    await leadsCol
+      .updateOne(leadFilter, {
+        $set: {
+          lastFollowup: "Just now",
+          needsHuman: Boolean(replyResult.escalateAfterOutbound),
+          conversationStatus: replyResult.escalateAfterOutbound
+            ? "awaiting_team_reply"
+            : "awaiting_customer_reply",
+          updatedAt: new Date(),
+        },
+      })
+      .catch(() => {});
+    const leadAfterSkip = await leadsCol.findOne(leadFilter);
+    if (leadAfterSkip) {
+      await syncAutoFollowupQueueFromLead(db, ownerUserId, leadAfterSkip, settings).catch(() => {});
+    }
+    await refreshLeadInterestScoreFromWaThread(
+      db,
+      ownerUserId,
+      msg.from,
+      displayPhone
+    ).catch(() => {});
+    await persistLog({ userId: ownerUserId, logsCol, msg, leadId, leadName, events, status: "skipped" });
+    return { leadId, status: "skipped" };
+  }
+
   const safeReplyText = coerceCompleteReply(replyResult.reply, leadName);
   if (safeReplyText !== replyResult.reply.trim().replace(/\s+/g, " ")) {
     console.warn("[auto-reply] replaced incomplete model response", {
@@ -615,18 +648,19 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   }
 
   // Update lead's lastFollowup
-    await leadsCol.updateOne(
-      leadFilter,
-      {
-        $set: {
-          lastFollowup: "Just now",
-          lastOutboundAt: new Date(),
-          needsHuman: false,
-          conversationStatus: "awaiting_customer_reply",
-          updatedAt: new Date(),
-        },
-      }
-    ).catch(() => {});
+  await leadsCol
+    .updateOne(leadFilter, {
+      $set: {
+        lastFollowup: "Just now",
+        lastOutboundAt: new Date(),
+        needsHuman: Boolean(replyResult.escalateAfterOutbound),
+        conversationStatus: replyResult.escalateAfterOutbound
+          ? "awaiting_team_reply"
+          : "awaiting_customer_reply",
+        updatedAt: new Date(),
+      },
+    })
+    .catch(() => {});
 
   const leadAfterReply = await leadsCol.findOne(leadFilter);
   if (leadAfterReply) {
@@ -641,14 +675,15 @@ async function processMessage(msg: ParsedWaMessage, db: ReturnType<typeof getDb>
   ).catch(() => {});
 
   addEvent("replied", {
-    replyText:    safeReplyText,
-    waMessageId:  sendResult.messageId,
-    mode:         sendResult.mode,
-    channel:      sendChannel,
-    engine:       replyResult.engine,
-    language:     replyResult.language,
-    needsHuman:   replyResult.needsHuman,
-    durationMs:   Date.now() - t10,
+    replyText:               safeReplyText,
+    waMessageId:             sendResult.messageId,
+    mode:                    sendResult.mode,
+    channel:                 sendChannel,
+    engine:                  replyResult.engine,
+    language:                replyResult.language,
+    needsHuman:              replyResult.needsHuman,
+    escalateAfterOutbound:   Boolean(replyResult.escalateAfterOutbound),
+    durationMs:              Date.now() - t10,
   });
 
   await persistLog({

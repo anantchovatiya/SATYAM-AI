@@ -13,6 +13,7 @@
  * Full `analyzeChat` still uses a dual-window prompt for language / sentiment / stage.
  */
 import OpenAI from "openai";
+import { shouldSkipAutoReplyForInboundText } from "@/lib/auto-reply-skip-media";
 
 // ── Types (re-exported for use in route handlers) ─────────────────────────────
 
@@ -48,6 +49,10 @@ export interface ReplyResult {
   needsHuman: boolean;
   engine: "openai" | "gemini" | "heuristic";
   sharedCatalogue: boolean;
+  /** When true, WhatsApp layer must not send text or catalogue for this turn (human-only follow-up or silent ack). */
+  skipOutbound?: boolean;
+  /** After a normal outbound message, mark the lead for human handoff (e.g. phone callback promised). */
+  escalateAfterOutbound?: boolean;
 }
 
 export interface FollowUpResult {
@@ -486,6 +491,32 @@ export async function generateReply(
     languageMirrorMode = false,
   } = options;
 
+  const inboundIntent = classifyInboundReplyIntent(customerMessage, context, languageMirrorMode);
+  if (inboundIntent.kind === "silent_skip") {
+    const lang = detectLanguageHeuristic(customerMessage);
+    return {
+      reply: "",
+      language: lang,
+      needsHuman: inboundIntent.escalateToHuman,
+      engine: "heuristic",
+      sharedCatalogue: false,
+      skipOutbound: true,
+      escalateAfterOutbound: inboundIntent.escalateToHuman,
+    };
+  }
+  if (inboundIntent.kind === "team_call_script") {
+    const lang = detectLanguageHeuristic(customerMessage);
+    return {
+      reply: ensureTerminalPunctuation(inboundIntent.replyText),
+      language: lang,
+      needsHuman: false,
+      engine: "heuristic",
+      sharedCatalogue: false,
+      skipOutbound: false,
+      escalateAfterOutbound: true,
+    };
+  }
+
   const lower = customerMessage.toLowerCase();
   const needsHuman = handoverKeywords.some((kw) => lower.includes(kw));
   const geminiKey = getGeminiKey();
@@ -668,11 +699,44 @@ ${knowledgeBase ? `\n\nBusiness knowledge base:\n${knowledgeBase}` : ""}`,
 
 // ── 3. generateFollowUp ──────────────────────────────────────────────────────
 
+const DEFAULT_FOLLOW_UP_TEMPLATE =
+  "Hello Sir! 😊 Kaise hain aap? Bas connect kar raha tha — jo bhi product / quantity par baat chal rahi thi, agar aapko aur clarity chahiye ho to bata dijiyega.";
+
+/** Lead text usable for a contextual nudge (not empty, not media-only placeholder, not emoji-only noise). */
+function hasSubstantiveLeadLastMessageForFollowUp(text: string): boolean {
+  if (shouldSkipAutoReplyForInboundText(text)) return false;
+  const t = text.trim();
+  const core = t.replace(/[\s\p{Extended_Pictographic}\uFE0F\u200D]+/gu, "").trim();
+  return core.length >= 2;
+}
+
+function followUpGreetingOnlyFallback(aiTone: string): string {
+  if (aiTone === "professional") {
+    return "Namaste Sir. Asha hai aap theek honge — kaise chal raha hai? Zarurat ho to likhiyega.";
+  }
+  if (aiTone === "premium") {
+    return "Sir, hope you are well — kaise hain aap? Batayein agar aapko abhi koi cheez par discuss karna ho.";
+  }
+  return "Hello Sir! Kaise hain aap? 😊 Bas yeh jaanne ke liye likha — sab theek hai na?";
+}
+
+function buildFollowUpStrictInstructions(): string {
+  return `FOLLOW-UP RULES (WhatsApp — lead has gone quiet after they messaged):
+- Always open with a brief warm check-in (e.g. kaise hain / hope you are doing well). Do not skip it.
+- Do NOT mention proposals, quotations, invoices, or “documents/PDF we sent” unless the LAST LEAD MESSAGE or the LAST OUR MESSAGE below explicitly refers to that exact thing (same topic).
+- Never pretend or assume a proposal was shared if there is no evidence in those lines.
+- If the last lead message clearly mentions a product, quantity, price, delivery, photos, or demo, you may add ONE short gentle question tied only to that topic — otherwise stay at greeting + open offer to help.
+- Maximum 2–3 short sentences total. Address as Sir only (not by personal name). Prefer Hinglish (Roman Hindi) unless the lead wrote only in another script/language — then mirror that script lightly.
+- Do not sound robotic or sales-pressurey.`;
+}
+
 export async function generateFollowUp(options: {
   leadName: string;
   leadId?: string;
   daysSinceLastMessage: number;
   lastMessage: string;
+  /** Last outbound text from our side (same thread), if known — improves context without inventing proposals. */
+  lastOutboundMessage?: string;
   followUpDelayDays?: number;
   followUpTemplate?: string;
   aiTone?: string;
@@ -681,9 +745,9 @@ export async function generateFollowUp(options: {
     leadName,
     daysSinceLastMessage,
     lastMessage,
+    lastOutboundMessage = "",
     followUpDelayDays = 2,
-    followUpTemplate =
-      "Hello Sir! 😊 Just checking in — kya aapne proposal dekh liya? Koi doubt ho to bataiye.",
+    followUpTemplate = DEFAULT_FOLLOW_UP_TEMPLATE,
     aiTone = "sales",
   } = options;
 
@@ -696,28 +760,46 @@ export async function generateFollowUp(options: {
     return { shouldSend: false, followUp: "", reason, engine: "heuristic" };
   }
 
+  const substantiveInbound = hasSubstantiveLeadLastMessageForFollowUp(lastMessage);
+  const outboundTrimmed = lastOutboundMessage.trim();
+  const outboundBlock =
+    outboundTrimmed.length > 0
+      ? `LAST OUR MESSAGE (verbatim excerpt; may be truncated):\n"""${outboundTrimmed.slice(0, 600)}${outboundTrimmed.length > 600 ? "…" : ""}"""\n`
+      : "LAST OUR MESSAGE: (not available — do not invent what we sent).\n";
+
   const geminiKey = getGeminiKey();
   const openai = getOpenAI();
-  const followUpFallback = () =>
-    followUpTemplate
+  const followUpFallback = () => {
+    const baseTpl =
+      /\bproposal\b/i.test(followUpTemplate) ? DEFAULT_FOLLOW_UP_TEMPLATE : followUpTemplate;
+    return baseTpl
       .replace(/{{name}}/gi, "Sir")
       .replace(/{{days}}/gi, String(daysSinceLastMessage));
+  };
+
+  if (!substantiveInbound) {
+    const followUp = ensureTerminalPunctuation(followUpGreetingOnlyFallback(aiTone));
+    return { shouldSend: true, followUp, reason, engine: "heuristic" };
+  }
 
   if (geminiKey) {
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const text = await callGemini({
           system: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.sales}
-You write follow-up messages for leads who have not responded.
-Address as Sir, not by personal name. Prefer Hinglish (Roman Hindi) unless the lead only used another language.
-Keep it under 3 sentences and avoid sounding pushy.
+${buildFollowUpStrictInstructions()}
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
 ${attempt === 1 ? "Your previous response was incomplete. Rewrite from scratch as a complete follow-up." : ""}`,
-          prompt: `Lead context name (do not use in text; say Sir): ${leadName}
-Days without response: ${daysSinceLastMessage}
-Last message from lead: "${lastMessage}"
-Template hint: "${followUpTemplate}"
+          prompt: `Lead reference name (do not use in text; say Sir): ${leadName}
+Days without response from lead: ${daysSinceLastMessage}
+
+LAST LEAD MESSAGE (verbatim):
+"""${lastMessage}"""
+
+${outboundBlock}
+Optional style hint from workspace template (do not copy blindly if it mentions proposals without evidence above): "${followUpTemplate}"
+
 Return only follow-up text.`,
           temperature: attempt === 0 ? 0.35 : 0.2,
           maxOutputTokens: 300,
@@ -750,19 +832,21 @@ Return only follow-up text.`,
             {
               role: "system",
               content: `${TONE_SYSTEM[aiTone] ?? TONE_SYSTEM.sales}
-You write follow-up messages for leads who have not responded.
-Use the template as a guide. Address as Sir (not by name). Prefer Hinglish in Roman script.
-Keep it under 3 sentences. Do not sound pushy.
+${buildFollowUpStrictInstructions()}
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
 ${attempt === 1 ? "Your previous response was incomplete. Rewrite from scratch as a complete follow-up." : ""}`,
             },
             {
               role: "user",
-              content: `Lead name: ${leadName}
-Days without response: ${daysSinceLastMessage}
-Their last message: "${lastMessage}"
-Template to adapt: "${followUpTemplate}"`,
+              content: `Lead reference name (do not use in text): ${leadName}
+Days without response from lead: ${daysSinceLastMessage}
+
+LAST LEAD MESSAGE:
+"""${lastMessage}"""
+
+${outboundBlock}
+Workspace template hint (optional; must follow strict rules above): "${followUpTemplate}"`,
             },
           ],
         });
@@ -895,7 +979,12 @@ function heuristicReply(
         : language === "Urdu"
         ? `Zaroor Sir! 😊 Main abhi AgriBird catalogue PDF bhej raha hoon — koi sawaal ho to poochiye.`
         : `Sure Sir! 😊 Sending the AgriBird catalogue PDF now — boliye agar kuch aur chahiye.`;
-  } else if (lower.includes("demo") || lower.includes("meeting") || lower.includes("call")) {
+  } else if (
+    /\b(demo|demonstration)\b/.test(lower) ||
+    /\bmeeting\b/.test(lower) ||
+    (/\bcall\b/.test(lower) &&
+      /\b(schedule|setup|book|demo|zoom|video|karwa|fix)\b/.test(lower))
+  ) {
     reply = localizedDemoReply(language, aiTone);
   } else if (lower.includes("price") || lower.includes("cost") || lower.includes("plan")) {
     reply = localizedPricingReply(language, aiTone);
@@ -1015,6 +1104,137 @@ function customerAsksForProductPhotos(message: string): boolean {
   }
 
   return productish;
+}
+
+/** Customer wants a phone callback (not a product “spray gun” or generic “call” mention). */
+function asksPhoneCallback(message: string): boolean {
+  const t = message.normalize("NFC").trim();
+  const lower = t.toLowerCase();
+
+  if (!t) return false;
+  if (/\b(video\s+call|zoom\s+call|google\s+meet|teams\s+meeting)\b/i.test(lower)) return false;
+
+  if (
+    /\b(call\s+me|give\s+(me\s+)?a\s+call|ring\s+me|phone\s+me|callback|call\s+back)\b/i.test(lower)
+  ) {
+    return true;
+  }
+
+  if (
+    /\bcall\b[\s\S]{0,8}\b(updaiye|update|upd)\b/i.test(lower) ||
+    /\b(updaiye|update)\b[\s\S]{0,12}\bcall\b/i.test(lower)
+  ) {
+    return true;
+  }
+
+  const romanPhoneAsk =
+    /\b(call|phone)\b[\s\S]{0,16}\b(kijiye|kariye|karo|kar\s*do|karwa|lagao|lagwa|lagwa\s*dijiye|lagwa\s*dijie|len|lena|loon|lo)\b/i.test(
+      lower
+    ) ||
+    /\b(kijiye|kariye|karo|kar\s*do|karwa|lagao|lagwa)\b[\s\S]{0,16}\b(call|phone)\b/i.test(lower) ||
+    /\b(mujhe|mujhko|humko|hame|hamen)\b[\s\S]{0,24}\b(call|phone)\b/i.test(lower);
+
+  const devanagariPhoneAsk =
+    /कॉल\s*(करें|करो|कीजिए|लगा|लगाएं|पर\s*बात)/.test(t) ||
+    /फ़ोन\s*(करें|करो|कीजिए|लगा|लगाएं|पर\s*बात)/.test(t) ||
+    /फोन\s*(करें|करो|कीजिए|लगा|लगाएं|पर\s*बात)/.test(t) ||
+    /\b(call|phone)\b[\s\S]{0,12}(करें|करो|कीजिए|लगा)/i.test(t);
+
+  return romanPhoneAsk || devanagariPhoneAsk;
+}
+
+/** Photo / video / demo asks: bot must not loop with clarifying questions — human sends assets or handles demo. */
+function asksForPhotoVideoOrDemo(message: string): boolean {
+  const t = message.normalize("NFC").trim();
+  const lower = t.toLowerCase();
+
+  const hasDemo =
+    /\b(demo|demonstration|walk\s*through)\b/i.test(lower) ||
+    /\u0921\u0947\u092e\u094b/.test(t); // डेमो
+
+  const hasVisual =
+    /\b(photo|photos|photograph|pic|pics|picture|pictures|image|images|snapshot|gallery|video|videos|clip|recording)\b/i.test(
+      lower
+    ) ||
+    /फ़ोटो|फोटो|तस्वीर|चित्र|वीडियो|व्हिडिओ|विडियो/.test(t);
+
+  const wantsAction =
+    /\b(send|share|show|forward|attach|whatsapp|mail|email|bhej|bhejo|bhejna|bheje|dikha|dikhao|dikhayi|dikhaye|chahiye|chahie|manga|mangta|mangte|dekhna|dekho|want|need|please|plz)\b/i.test(
+      lower
+    ) ||
+    /भेज|दिखा|चाहिए|भेजें|भेजो|देखना|दिखाएं/.test(t);
+
+  if (hasDemo && !/\b(no\s+demo|without\s+demo)\b/i.test(lower)) {
+    if (wantsAction || lower.trim().length <= 14) return true;
+  }
+
+  if (hasVisual && wantsAction) return true;
+
+  return customerAsksForProductPhotos(message);
+}
+
+/** Short “ok / yes / हाँ” after we already spoke — do not send another bot message. */
+function isStandaloneAcknowledgementOnly(message: string, context: IncomingMessage[]): boolean {
+  const outboundBefore = context.filter((m) => m.direction === "out").length;
+  if (outboundBefore === 0) return false;
+
+  const core = message.trim().replace(/^[\s"'“‘]+|[\s"'”’!.]+$/g, "").trim();
+  if (!core || core.length > 42) return false;
+
+  if (asksPhoneCallback(core) || asksForPhotoVideoOrDemo(core)) return false;
+  if (/[?؟]/.test(core)) return false;
+
+  const lower = core.toLowerCase();
+
+  const latinAck =
+    /^(ok|okay|o\.?\s*k\.?|k\.?|yes|yeah|yep|yup|yess|haan|haan ji|ha|han|han ji|hmm+|hm+|ji|ji sir|sir ji|theek|thik|thik hai|theek hai|thik h|accha|acha|achha|achha ji|sure|right|alright|fine|cool|got it|gotcha|samajh gaya|samajh gayi|samajh liya|thanks|thank you|thank u|thx|tnx|shukriya|dhanyawad|noted|understood)(\s+(sir|ji)(\s+ji)?)?$/i.test(
+      lower
+    );
+
+  const devanagariAck =
+    /^(\u0939\u093e\u0902|\u0939\u093e\u0902\u091c\u0940|\u091c\u0940|\u092f\u0938|\u092c\u093f\u0932\u094d\u0915\u0941\u0932|\u0920\u0940\u0915|\u0920\u0940\u0915\u094d|\u0928\u092e\u0938\u094d\u0924\u0947|\u0927\u0928\u094d\u092f\u0935\u093e\u0926)(\s+[\u0900-\u097F\s]{0,10}(sir|\u0938\u0930)?)?$/u.test(
+      core
+    );
+
+  return latinAck || devanagariAck;
+}
+
+function localizedTeamWillCallReply(customerMessage: string, languageMirrorMode: boolean): string {
+  const mirrorScript =
+    languageMirrorMode &&
+    (/[\u0900-\u097F]/.test(customerMessage) || detectLanguageHeuristic(customerMessage) === "Hindi");
+  if (mirrorScript) {
+    return "जी Sir, हमारी टीम का सदस्य अभी आपको कॉल करेगा।";
+  }
+  return "Ji Sir, hamara team member abhi aapko call karega.";
+}
+
+type InboundReplyIntent =
+  | { kind: "continue" }
+  | { kind: "silent_skip"; escalateToHuman: boolean }
+  | { kind: "team_call_script"; replyText: string };
+
+function classifyInboundReplyIntent(
+  customerMessage: string,
+  context: IncomingMessage[],
+  languageMirrorMode: boolean
+): InboundReplyIntent {
+  const trimmed = customerMessage.trim();
+  if (!trimmed) return { kind: "continue" };
+
+  if (asksPhoneCallback(trimmed)) {
+    return { kind: "team_call_script", replyText: localizedTeamWillCallReply(trimmed, languageMirrorMode) };
+  }
+
+  if (asksForPhotoVideoOrDemo(trimmed)) {
+    return { kind: "silent_skip", escalateToHuman: true };
+  }
+
+  if (isStandaloneAcknowledgementOnly(trimmed, context)) {
+    return { kind: "silent_skip", escalateToHuman: false };
+  }
+
+  return { kind: "continue" };
 }
 
 /** True if an earlier AGENT message shows we already shared the PDF or discussed the catalogue as already available in the chat. */

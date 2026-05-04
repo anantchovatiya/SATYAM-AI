@@ -77,7 +77,7 @@ export const DEFAULT_SETTINGS: Omit<AutomationSettings, "_id" | "userId"> = {
   greetingTemplate:
     "Hi Sir! 👋 Thanks for connecting with us.\nBataiye kaun sa product / quantity dekh rahe ho — main help kar dunga.",
   followUpTemplate:
-    "Hello Sir! 😊 Just following up — kya aapne proposal dekh liya?\nAgar koi sawaal ho to bataiye, main yahin hoon.",
+    "Hello Sir! 😊 Kaise hain aap? Bas touch base kar raha tha — agar product ya quantity par koi help chahiye ho to bata dijiyega.",
   aiTone: "sales",
   updatedAt: new Date(),
 };

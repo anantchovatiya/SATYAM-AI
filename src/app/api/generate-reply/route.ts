@@ -71,9 +71,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       data: {
-        reply:      result.reply,
-        language:   result.language,
-        needsHuman: result.needsHuman,
+        reply:                   result.reply,
+        language:                result.language,
+        needsHuman:              result.needsHuman,
+        skipOutbound:            Boolean(result.skipOutbound),
+        escalateAfterOutbound:   Boolean(result.escalateAfterOutbound),
       },
       meta: {
         engine:      result.engine,

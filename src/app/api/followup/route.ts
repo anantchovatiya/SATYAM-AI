@@ -13,6 +13,7 @@
  *   leadName:              string;
  *   daysSinceLastMessage:  number;
  *   lastMessage:           string;
+ *   lastOutboundMessage?:  string; // optional — last text we sent; improves AI context
  *   settings?: {
  *     followUpDelayDays?:  number;   // default 2
  *     followUpTemplate?:   string;
@@ -40,6 +41,8 @@ export async function POST(req: NextRequest) {
     const leadName: string = body.leadName ?? "there";
     const daysSince: number = Number(body.daysSinceLastMessage) || 0;
     const lastMessage: string = body.lastMessage ?? "";
+    const lastOutboundMessage: string =
+      typeof body.lastOutboundMessage === "string" ? body.lastOutboundMessage : "";
     const settings = body.settings ?? {};
 
     const result = await generateFollowUp({
@@ -47,6 +50,7 @@ export async function POST(req: NextRequest) {
       leadName,
       daysSinceLastMessage: daysSince,
       lastMessage,
+      lastOutboundMessage,
       followUpDelayDays:    Number(settings.followUpDelayDays) || 2,
       followUpTemplate:     settings.followUpTemplate,
       aiTone:               settings.aiTone ?? "friendly",

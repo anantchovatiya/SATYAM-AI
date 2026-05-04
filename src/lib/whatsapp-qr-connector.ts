@@ -618,6 +618,28 @@ async function processQrInboundAutoReply(args: {
       autoShareCatalogue: settings.autoShareCatalogue,
       languageMirrorMode: settings.languageMirrorMode,
     });
+    if (reply.skipOutbound) {
+      if (lead?._id) {
+        await leadsCol
+          .updateOne(
+            { _id: lead._id },
+            {
+              $set: {
+                conversationStatus: reply.escalateAfterOutbound
+                  ? "awaiting_team_reply"
+                  : "awaiting_customer_reply",
+                needsHuman: Boolean(reply.escalateAfterOutbound),
+                lastInboundAt: new Date(),
+                updatedAt: new Date(),
+              },
+            }
+          )
+          .catch(() => {});
+      }
+      store.recentReplyByPhone.set(from, Date.now());
+      store.processedInboundIds.add(inboundId);
+      return;
+    }
     const safeReplyText = coerceCompleteReply(reply.reply, lead?.name ?? args.senderName);
     if (safeReplyText !== reply.reply.trim().replace(/\s+/g, " ")) {
       console.warn("[wa-qr] replaced incomplete model response", {
@@ -666,6 +688,21 @@ async function processQrInboundAutoReply(args: {
           console.warn("[wa-qr] catalogue PDF send failed:", catResult.error);
         }
       }
+    }
+
+    if (lead?._id && reply.escalateAfterOutbound) {
+      await leadsCol
+        .updateOne(
+          { _id: lead._id },
+          {
+            $set: {
+              needsHuman: true,
+              conversationStatus: "awaiting_team_reply",
+              updatedAt: new Date(),
+            },
+          }
+        )
+        .catch(() => {});
     }
 
     store.recentReplyByPhone.set(from, Date.now());
@@ -801,6 +838,28 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
         autoShareCatalogue: settings.autoShareCatalogue,
         languageMirrorMode: settings.languageMirrorMode,
       });
+      if (reply.skipOutbound) {
+        if (lead?._id) {
+          await leadsCol
+            .updateOne(
+              { _id: lead._id },
+              {
+                $set: {
+                  conversationStatus: reply.escalateAfterOutbound
+                    ? "awaiting_team_reply"
+                    : "awaiting_customer_reply",
+                  needsHuman: Boolean(reply.escalateAfterOutbound),
+                  lastInboundAt: msg.timestamp,
+                  updatedAt: new Date(),
+                },
+              }
+            )
+            .catch(() => {});
+        }
+        store.recentReplyByPhone.set(threadCanon, Date.now());
+        store.processedInboundIds.add(inboundId);
+        continue;
+      }
       const safeReplyText = coerceCompleteReply(reply.reply, lead?.name ?? msg.senderName ?? "there");
       if (safeReplyText !== reply.reply.trim().replace(/\s+/g, " ")) {
         console.warn("[wa-qr] replaced incomplete model response (sweep)", {
@@ -848,6 +907,21 @@ async function runQrAutoReplySweep(userIdHex: string, userId: ObjectId, limit = 
             console.warn("[wa-qr] catalogue PDF send failed:", catResult.error);
           }
         }
+      }
+
+      if (lead?._id && reply.escalateAfterOutbound) {
+        await leadsCol
+          .updateOne(
+            { _id: lead._id },
+            {
+              $set: {
+                needsHuman: true,
+                conversationStatus: "awaiting_team_reply",
+                updatedAt: new Date(),
+              },
+            }
+          )
+          .catch(() => {});
       }
 
       store.recentReplyByPhone.set(threadCanon, Date.now());
