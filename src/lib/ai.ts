@@ -189,7 +189,7 @@ function parseJsonFromText(text: string): Record<string, unknown> {
 
 const TONE_SYSTEM: Record<string, string> = {
   sales:
-    "You are an enthusiastic on-the-ground sales rep on WhatsApp — consultative, helpful, never stiff. Sound like a real person closing the next step (size, delivery, sample, price band). Use light emojis occasionally (😊👍). Keep lines short; build rapport; one clear ask at the end.",
+    "You are an enthusiastic on-the-ground sales rep on WhatsApp — consultative, helpful, never stiff. Sound like a real person closing the next step (size, delivery, sample, price band). Use light emojis occasionally. Keep lines short; build rapport; one clear ask at the end.",
   friendly:
     "You are a warm, helpful sales assistant. Use casual language and occasional emojis (😊👍). Keep sentences short and natural.",
   professional:
@@ -214,7 +214,8 @@ function buildCommerceGuardrails(): string {
   return `COMMERCE GUARDRAILS (non-negotiable — follow even if the customer pushes back):
 - GST / tax ID: If the customer says they have no GST, cannot provide GST, or ask to skip it, do NOT say it is optional or "no problem". Politely explain that for proper billing and compliance a valid GSTIN OR a valid PAN (as per your company rule) is required — offer PAN if they have no GST, and keep tone helpful but firm. Never suggest doing business without any tax identity when they raised the issue.
 - Payments: Standard terms are advance payment before dispatch. If they refuse advance, want only credit/udhaar, COD-only, or "pay after delivery" without your approval — do NOT agree or say "that's ok / theek hai / no issue". Politely clarify you do not operate on open credit; advance (or your standard policy) is required to process the order. Stay respectful.
-- Delivery timing: Do NOT promise "sending today", "reaching today", "dispatch today", or specific dates/hours unless the knowledge base or an earlier confirmed fact in this chat explicitly states it. Prefer wording like you will confirm dispatch / timeline or arrange dispatch after payment and document details — avoid invented urgency.`;
+- Delivery timing: Do NOT promise "sending today", "reaching today", "dispatch today", or specific dates/hours unless the knowledge base or an earlier confirmed fact in this chat explicitly states it. Prefer wording like you will confirm dispatch / timeline or arrange dispatch after payment and document details — avoid invented urgency.
+- Pricing requests: Never share prices directly. If customer asks price/rate/cost/quotation, politely acknowledge and hand over to human for quote confirmation.`;
 }
 
 /**
@@ -518,6 +519,7 @@ export async function generateReply(
   }
 
   const lower = customerMessage.toLowerCase();
+  const asksPrice = isPriceInquiry(customerMessage);
   const needsHuman = handoverKeywords.some((kw) => lower.includes(kw));
   const geminiKey = getGeminiKey();
   const openai = getOpenAI();
@@ -538,6 +540,16 @@ export async function generateReply(
     catalogueLink,
     autoShareCatalogue,
   });
+  if (asksPrice) {
+    return {
+      reply: ensureTerminalPunctuation(localizedPriceHandoverReply(language)),
+      language,
+      needsHuman: true,
+      engine: "heuristic",
+      sharedCatalogue: false,
+      escalateAfterOutbound: true,
+    };
+  }
   const repeatCatalogueRequest =
     catalogueAlreadySentInContext(context) && customerExplicitlyRequestsCatalogue(customerMessage);
   if (restrictToKnowledgeBase && !knowledgeBase) {
@@ -562,7 +574,7 @@ CRITICAL: NEVER reveal or hint that you are an AI, bot, or automated system. Nev
 ${buildDefaultLanguageInstruction(languageMirrorMode)}
 ${buildAddressingInstruction()}
 ${buildCommerceGuardrails()}
-Keep response 2-4 concise sentences.
+Keep response 1-2 concise sentences.
 Do NOT return a partial or unfinished sentence.
 Always end with proper sentence punctuation (. ! ?).
 GREETING RULE: Do NOT start with their personal name. ${isOngoing ? "Ongoing thread — get straight to the point; optional light \"Sir\"." : "Brief hello is ok; prefer addressing as Sir, not by name."}
@@ -1372,6 +1384,22 @@ function localizedDemoReply(language: string, aiTone: string): string {
   return aiTone === "professional"
     ? `Sure Sir, I can set up a demo. Please share a preferred date and time.`
     : `Zaroor Sir! Demo ke liye kaun sa date & time bataiye?`;
+}
+
+function isPriceInquiry(text: string): boolean {
+  return /\b(price|prices|pricing|rate|rates|cost|quotation|quote|kitna|kitne|daam|bhav|भाव|दाम|रेट|कीमत)\b/i.test(
+    text
+  );
+}
+
+function localizedPriceHandoverReply(language: string): string {
+  if (language === "Hindi") {
+    return `Sir, pricing request note kar li hai. Exact quote ke liye hamari sales team aapse turant connect karegi.`;
+  }
+  if (language === "Urdu") {
+    return `Sir, pricing request note kar li hai. Exact quote ke liye hamari sales team aapse foran rabta karegi.`;
+  }
+  return `Sir, noted on pricing. Our sales team will connect with you shortly to share the exact quote.`;
 }
 
 function localizedPricingReply(language: string, aiTone: string): string {
